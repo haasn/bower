@@ -1039,14 +1039,17 @@ thread_pager_input(Key, Action, MessageUpdate, !Info) :-
     ;
         Key = char('r')
     ->
+        mark_preceding_read(!Info),
         reply(!.Info, direct_reply, Action, MessageUpdate)
     ;
         Key = char('e')
     ->
+        mark_preceding_read(!Info),
         reply(!.Info, group_reply, Action, MessageUpdate)
     ;
         Key = char('L')
     ->
+        mark_preceding_read(!Info),
         reply(!.Info, list_reply, Action, MessageUpdate)
     ;
         Key = char('B')
