@@ -688,8 +688,8 @@ key_binding_char('j', scroll_down).
 key_binding_char('k', scroll_up).
 key_binding_char('g', home).
 key_binding_char('G', end).
-key_binding_char('[', half_page_up).
-key_binding_char(']', half_page_down).
+key_binding_char('(', half_page_up).
+key_binding_char(')', half_page_down).
 key_binding_char('\t', skip_to_unread).
 key_binding_char('\r', enter).
 key_binding_char('l', enter_limit).

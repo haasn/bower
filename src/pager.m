@@ -850,8 +850,8 @@ char_binding('\\', scroll_up).
 char_binding('\b', scroll_up).   % XXX doesn't work
 char_binding(' ', page_down).
 char_binding('b', page_up).
-char_binding(']', half_page_down).
-char_binding('[', half_page_up).
+char_binding(')', half_page_down).
+char_binding('(', half_page_up).
 char_binding('j', next_message).
 char_binding('k', prev_message).
 char_binding('S', skip_quoted_text).

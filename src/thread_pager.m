@@ -844,13 +844,13 @@ thread_pager_input(Key, Action, MessageUpdate, !Info) :-
         scroll(-1, MessageUpdate, !Info),
         Action = continue
     ;
-        Key = char(']')
+        Key = char(')')
     ->
         Delta = int.min(15, NumPagerRows - 1),
         scroll_but_stop_at_message(Delta, MessageUpdate, !Info),
         Action = continue
     ;
-        Key = char('[')
+        Key = char('(')
     ->
         Delta = int.min(15, NumPagerRows - 1),
         scroll_but_stop_at_message(-Delta, MessageUpdate, !Info),
