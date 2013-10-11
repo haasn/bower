@@ -906,7 +906,7 @@ thread_pager_input(Key, Action, MessageUpdate, !Info) :-
         Key = char('\x12\') % ^R
     ->
         mark_preceding_read(!Info),
-        next_message(MessageUpdate, !Info),
+        skip_to_unread(MessageUpdate, !Info),
         Action = continue
     ;
         Key = char('N')
