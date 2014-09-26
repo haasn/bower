@@ -766,6 +766,22 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
             update_message(Screen, MessageUpdate0, !IO),
             Action = continue
         )
+%%% testing
+    ; KeyCode = char('*') ->
+        Attachments = get_lines_list(!.AttachInfo),
+        create_temp_message_file(Config, prepare_send, Headers, ParsedHeaders,
+            Text, Attachments, !.CryptoInfo, ResFilename, _MaybeWarning, !IO),
+        (
+            ResFilename = ok(Filename),
+            MessageUpdate = set_info("wrote " ++ Filename),
+            Action = continue
+        ;
+            ResFilename = error(Error),
+            MessageUpdate = set_warning(Error),
+            Action = continue
+        ),
+        update_message(Screen, MessageUpdate, !IO)
+%%% end testing
     ; KeyCode = char('D') ->
         % XXX prompt to discard
         (
