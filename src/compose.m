@@ -7,6 +7,7 @@
 :- import_module bool.
 :- import_module io.
 
+:- import_module crypto.
 :- import_module data.
 :- import_module prog_config.
 :- import_module rfc5322.
@@ -23,18 +24,20 @@
     --->    sent
     ;       not_sent.
 
-:- pred start_compose(prog_config::in, screen::in,
+:- pred start_compose(prog_config::in, crypto::in, screen::in,
     screen_transition(sent)::out, history::in, history::out,
     history::in, history::out, io::di, io::uo) is det.
 
-:- pred start_reply(prog_config::in, screen::in, message::in(message),
-    reply_kind::in, screen_transition(sent)::out, io::di, io::uo) is det.
+:- pred start_reply(prog_config::in, crypto::in, screen::in,
+    message::in(message), reply_kind::in, screen_transition(sent)::out,
+    io::di, io::uo) is det.
 
-:- pred start_reply_to_message_id(prog_config::in, screen::in, message_id::in,
-    reply_kind::in, screen_transition(sent)::out, io::di, io::uo) is det.
+:- pred start_reply_to_message_id(prog_config::in, crypto::in, screen::in,
+    message_id::in, reply_kind::in, screen_transition(sent)::out,
+    io::di, io::uo) is det.
 
-:- pred continue_postponed(prog_config::in, screen::in, message::in(message),
-    screen_transition(sent)::out, io::di, io::uo) is det.
+:- pred continue_postponed(prog_config::in, crypto::in, screen::in,
+    message::in(message), screen_transition(sent)::out, io::di, io::uo) is det.
 
     % Exported for resend.
     %
@@ -56,8 +59,11 @@
 :- import_module map.
 :- import_module maybe.
 :- import_module pair.
+:- import_module random.
 :- import_module require.
+:- import_module set.
 :- import_module string.
+:- import_module time.
 
 :- import_module addressbook.
 :- import_module call_system.
@@ -65,6 +71,8 @@
 :- import_module color.
 :- import_module curs.
 :- import_module curs.panel.
+:- import_module gpgme.
+:- import_module gpgme.key.
 :- import_module maildir.
 :- import_module message_file.
 :- import_module mime_type.
@@ -81,7 +89,11 @@
 :- import_module send_util.
 :- import_module string_util.
 :- import_module tags.
+:- import_module time_util.
 :- import_module write_message.
+
+:- include_module compose.crypto.
+:- import_module compose.crypto.
 
 :- type header_type
     --->    from
@@ -137,7 +149,8 @@
 
 %-----------------------------------------------------------------------------%
 
-start_compose(Config, Screen, Transition, !ToHistory, !SubjectHistory, !IO) :-
+start_compose(Config, Crypto, Screen, Transition, !ToHistory, !SubjectHistory,
+        !IO) :-
     text_entry_initial(Screen, "To: ", !.ToHistory, "",
         complete_config_key(Config, addressbook_section), MaybeInput, !IO),
     (
@@ -145,8 +158,8 @@ start_compose(Config, Screen, Transition, !ToHistory, !SubjectHistory, !IO) :-
         add_history_nodup(Input, !ToHistory),
         ( is_mailto_uri(Input) ->
             ( extract_mailto(Input, Headers, Body) ->
-                start_compose_2(Config, Screen, Headers, Body, Transition,
-                    !SubjectHistory, !IO)
+                start_compose_2(Config, Crypto, Screen, Headers, Body,
+                    Transition, !SubjectHistory, !IO)
             ;
                 Message = set_warning("Could not parse mailto URI."),
                 Transition = screen_transition(not_sent, Message)
@@ -156,7 +169,7 @@ start_compose(Config, Screen, Transition, !ToHistory, !SubjectHistory, !IO) :-
             Headers0 = init_headers,
             Headers = Headers0 ^ h_to := header_value(To),
             Body = "",
-            start_compose_2(Config, Screen, Headers, Body, Transition,
+            start_compose_2(Config, Crypto, Screen, Headers, Body, Transition,
                 !SubjectHistory, !IO)
         )
     ;
@@ -164,11 +177,11 @@ start_compose(Config, Screen, Transition, !ToHistory, !SubjectHistory, !IO) :-
         Transition = screen_transition(not_sent, no_change)
     ).
 
-:- pred start_compose_2(prog_config::in, screen::in, headers::in, string::in,
-    screen_transition(sent)::out, history::in, history::out, io::di, io::uo)
-    is det.
+:- pred start_compose_2(prog_config::in, crypto::in, screen::in, headers::in,
+    string::in, screen_transition(sent)::out, history::in, history::out,
+    io::di, io::uo) is det.
 
-start_compose_2(Config, Screen, !.Headers, Body, Transition,
+start_compose_2(Config, Crypto, Screen, !.Headers, Body, Transition,
         !SubjectHistory, !IO) :-
     Subject0 = header_value_string(!.Headers ^ h_subject),
     ( Subject0 = "" ->
@@ -178,26 +191,29 @@ start_compose_2(Config, Screen, !.Headers, Body, Transition,
             MaybeSubject = yes(Subject),
             add_history_nodup(Subject, !SubjectHistory),
             !Headers ^ h_subject := decoded_unstructured(Subject),
-            start_compose_3(Config, Screen, !.Headers, Body, Transition, !IO)
+            start_compose_3(Config, Crypto, Screen, !.Headers, Body,
+                Transition, !IO)
         ;
             MaybeSubject = no,
             Transition = screen_transition(not_sent, no_change)
         )
     ;
-        start_compose_3(Config, Screen, !.Headers, Body, Transition, !IO)
+        start_compose_3(Config, Crypto, Screen, !.Headers, Body, Transition,
+            !IO)
     ).
 
-:- pred start_compose_3(prog_config::in, screen::in, headers::in, string::in,
-    screen_transition(sent)::out, io::di, io::uo) is det.
+:- pred start_compose_3(prog_config::in, crypto::in, screen::in, headers::in,
+    string::in, screen_transition(sent)::out, io::di, io::uo) is det.
 
-start_compose_3(Config, Screen, !.Headers, Body, Transition, !IO) :-
+start_compose_3(Config, Crypto, Screen, !.Headers, Body, Transition, !IO) :-
     get_from_address(Config, FromAddress, !IO),
     address_to_string(no_encoding, FromAddress, From, _FromValid),
     !Headers ^ h_from := header_value(From),
     Attachments = [],
     MaybeOldDraft = no,
-    create_edit_stage(Config, Screen, !.Headers, Body, Attachments,
-        MaybeOldDraft, Transition, !IO).
+    EncryptInit = no,
+    create_edit_stage(Config, Crypto, Screen, !.Headers, Body, Attachments,
+        MaybeOldDraft, EncryptInit, Transition, !IO).
 
 %-----------------------------------------------------------------------------%
 
@@ -253,7 +269,7 @@ expand_aliases(Config, QuoteOpt, Input, Output, !IO) :-
 
 %-----------------------------------------------------------------------------%
 
-start_reply(Config, Screen, Message, ReplyKind, Transition, !IO) :-
+start_reply(Config, Crypto, Screen, Message, ReplyKind, Transition, !IO) :-
     get_notmuch_command(Config, Notmuch),
     Message ^ m_id = MessageId,
     make_quoted_command(Notmuch, [
@@ -277,8 +293,9 @@ start_reply(Config, Screen, Message, ReplyKind, Transition, !IO) :-
         ),
         Attachments = [],
         MaybeOldDraft = no,
-        create_edit_stage(Config, Screen, Headers, Text, Attachments,
-            MaybeOldDraft, Transition, !IO)
+        EncryptInit = contains_encrypted_tag(Message ^ m_tags),
+        create_edit_stage(Config, Crypto, Screen, Headers, Text, Attachments,
+            MaybeOldDraft, EncryptInit, Transition, !IO)
     ;
         CommandResult = error(Error),
         string.append_list(["Error running notmuch: ",
@@ -347,10 +364,15 @@ set_headers_for_list_reply(OrigFrom, !Headers) :-
 similar_mailbox(AddrSpec, OtherAddress) :-
     OtherAddress = mailbox(mailbox(_DisplayName, AddrSpec)).
 
+:- func contains_encrypted_tag(set(tag)) = bool.
+
+contains_encrypted_tag(Tags) =
+    pred_to_bool(contains(Tags, tag("encrypted"))).
+
 %-----------------------------------------------------------------------------%
 
-start_reply_to_message_id(Config, Screen, MessageId, ReplyKind, Transition,
-        !IO) :-
+start_reply_to_message_id(Config, Crypto, Screen, MessageId, ReplyKind,
+        Transition, !IO) :-
     run_notmuch(Config, [
         "show", "--format=json", "--part=0", "--",
         message_id_to_search_term(MessageId)
@@ -359,7 +381,8 @@ start_reply_to_message_id(Config, Screen, MessageId, ReplyKind, Transition,
         Res = ok(Message),
         (
             Message = message(_, _, _, _, _, _),
-            start_reply(Config, Screen, Message, ReplyKind, Transition, !IO)
+            start_reply(Config, Crypto, Screen, Message, ReplyKind, Transition,
+                !IO)
         ;
             Message = excluded_message(_),
             Warning = "Excluded message.",
@@ -372,9 +395,10 @@ start_reply_to_message_id(Config, Screen, MessageId, ReplyKind, Transition,
 
 %-----------------------------------------------------------------------------%
 
-continue_postponed(Config, Screen, Message, Transition, !IO) :-
+continue_postponed(Config, Crypto, Screen, Message, Transition, !IO) :-
     MessageId = Message ^ m_id,
     Headers0 = Message ^ m_headers,
+    Tags0 = Message ^ m_tags,
     Body0 = Message ^ m_body,
     first_text_part(Body0, Text, AttachmentParts),
     list.map(to_old_attachment, AttachmentParts, Attachments),
@@ -396,8 +420,9 @@ continue_postponed(Config, Screen, Message, Transition, !IO) :-
             !Headers ^ h_inreplyto := (HeadersB ^ h_inreplyto),
             Headers = !.Headers
         ),
-        create_edit_stage(Config, Screen, Headers, Text, Attachments,
-            yes(MessageId), Transition, !IO)
+        EncryptInit = contains_encrypted_tag(Tags0),
+        create_edit_stage(Config, Crypto, Screen, Headers, Text, Attachments,
+            yes(MessageId), EncryptInit, Transition, !IO)
     ;
         CallRes = error(Error),
         string.append_list(["Error running notmuch: ",
@@ -431,15 +456,28 @@ to_old_attachment(Part, old_attachment(Part)).
 
 %-----------------------------------------------------------------------------%
 
-:- pred create_edit_stage(prog_config::in, screen::in, headers::in, string::in,
-    list(attachment)::in, maybe(message_id)::in, screen_transition(sent)::out,
+:- pred create_edit_stage(prog_config::in, crypto::in, screen::in, headers::in,
+    string::in, list(attachment)::in, maybe(message_id)::in, bool::in,
+    screen_transition(sent)::out, io::di, io::uo) is det.
+
+create_edit_stage(Config, Crypto, Screen, Headers0, Text0, Attachments,
+        MaybeOldDraft, EncryptInit, Transition, !IO) :-
+    CryptoInfo0 = init_crypto_info(Crypto, EncryptInit),
+    create_edit_stage_2(Config, Screen, Headers0, Text0, Attachments,
+        MaybeOldDraft, Transition, CryptoInfo0, CryptoInfo, !IO),
+    unref_keys(CryptoInfo, !IO).
+
+:- pred create_edit_stage_2(prog_config::in, screen::in,
+    headers::in, string::in, list(attachment)::in, maybe(message_id)::in,
+    screen_transition(sent)::out, crypto_info::in, crypto_info::out,
     io::di, io::uo) is det.
 
-create_edit_stage(Config, Screen, Headers0, Text0, Attachments, MaybeOldDraft,
-        Transition, !IO) :-
+create_edit_stage_2(Config, Screen, Headers0, Text0, Attachments,
+        MaybeOldDraft, Transition, !CryptoInfo, !IO) :-
     make_parsed_headers(Headers0, ParsedHeaders0),
-    create_temp_message_file(Config, prepare_edit, Headers0, ParsedHeaders0,
-        Text0, Attachments, ResFilename, !IO),
+    create_temp_message_file(Config, prepare_edit, Headers0,
+        ParsedHeaders0, Text0, Attachments, !.CryptoInfo, ResFilename,
+        _MaybeWarning, !IO),
     (
         ResFilename = ok(Filename),
         call_editor(Config, Filename, ResEdit, !IO),
@@ -451,7 +489,7 @@ create_edit_stage(Config, Screen, Headers0, Text0, Attachments, MaybeOldDraft,
                 io.remove_file(Filename, _, !IO),
                 update_references(Headers0, Headers1, Headers2),
                 enter_staging(Config, Screen, Headers2, Text, Attachments,
-                    MaybeOldDraft, Transition, !IO)
+                    MaybeOldDraft, Transition, !CryptoInfo, !IO)
             ;
                 ResParse = error(Error),
                 io.error_message(Error, Msg),
@@ -528,18 +566,20 @@ update_references(Headers0, !Headers) :-
 
 :- pred enter_staging(prog_config::in, screen::in, headers::in, string::in,
     list(attachment)::in, maybe(message_id)::in, screen_transition(sent)::out,
-    io::di, io::uo) is det.
+    crypto_info::in, crypto_info::out, io::di, io::uo) is det.
 
 enter_staging(Config, Screen, Headers0, Text, Attachments, MaybeOldDraft,
-        Transition, !IO) :-
+        Transition, !CryptoInfo, !IO) :-
     parse_and_expand_headers(Config, Headers0, Headers, Parsed, !IO),
+    maintain_encrypt_keys(Parsed, !CryptoInfo, !IO),
+
     StagingInfo = staging_info(Config, Headers, Parsed, Text, MaybeOldDraft,
         init_history),
     AttachInfo = scrollable.init_with_cursor(Attachments),
     get_cols(Screen, Cols),
     setup_pager_for_staging(Config, Cols, Text, new_pager, PagerInfo),
     staging_screen(Screen, StagingInfo, AttachInfo, PagerInfo, Transition,
-        !IO).
+        !CryptoInfo, !IO).
 
 :- pred parse_and_expand_headers(prog_config::in, headers::in, headers::out,
     parsed_headers::out, io::di, io::uo) is det.
@@ -617,10 +657,11 @@ maybe_expand_mailbox(Config, Opt, Mailbox0, Mailbox, !IO) :-
 %-----------------------------------------------------------------------------%
 
 :- pred staging_screen(screen::in, staging_info::in, attach_info::in,
-    pager_info::in, screen_transition(sent)::out, io::di, io::uo) is det.
+    pager_info::in, screen_transition(sent)::out,
+    crypto_info::in, crypto_info::out, io::di, io::uo) is det.
 
 staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
-        !IO) :-
+        !CryptoInfo, !IO) :-
     !.StagingInfo = staging_info(Config, Headers, ParsedHeaders, Text,
         MaybeOldDraft, _AttachHistory),
     Attrs = compose_attrs(Config),
@@ -628,7 +669,8 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
 
     split_panels(Screen, HeaderPanels, AttachmentPanels, MaybeSepPanel,
         PagerPanels),
-    draw_header_lines(HeaderPanels, Attrs, Headers, ParsedHeaders, !IO),
+    draw_header_lines(HeaderPanels, Attrs, Headers, ParsedHeaders,
+        !.CryptoInfo, !IO),
     scrollable.draw(draw_attachment_line(Attrs), AttachmentPanels,
         !.AttachInfo, !IO),
     draw_attachments_label(Attrs, AttachmentPanels, !IO),
@@ -643,22 +685,25 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
     ( KeyCode = char('e') ->
         Action = edit
     ; KeyCode = char('f') ->
-        edit_header(Screen, from, !StagingInfo, !IO),
+        edit_header(Screen, from, !StagingInfo, !CryptoInfo, !IO),
         Action = continue
     ; KeyCode = char('t') ->
-        edit_header(Screen, to, !StagingInfo, !IO),
+        edit_header(Screen, to, !StagingInfo, !CryptoInfo, !IO),
         Action = continue
     ; KeyCode = char('c') ->
-        edit_header(Screen, cc, !StagingInfo, !IO),
+        edit_header(Screen, cc, !StagingInfo, !CryptoInfo, !IO),
         Action = continue
     ; KeyCode = char('b') ->
-        edit_header(Screen, bcc, !StagingInfo, !IO),
+        edit_header(Screen, bcc, !StagingInfo, !CryptoInfo, !IO),
         Action = continue
     ; KeyCode = char('s') ->
-        edit_header(Screen, subject, !StagingInfo, !IO),
+        edit_header(Screen, subject, !StagingInfo, !CryptoInfo, !IO),
         Action = continue
     ; KeyCode = char('r') ->
-        edit_header(Screen, replyto, !StagingInfo, !IO),
+        edit_header(Screen, replyto, !StagingInfo, !CryptoInfo, !IO),
+        Action = continue
+    ; KeyCode = char('E') ->
+        toggle_encrypt(!StagingInfo, !CryptoInfo, !IO),
         Action = continue
     ;
         ( KeyCode = char('j')
@@ -687,7 +732,7 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
     ; KeyCode = char('p') ->
         Attachments = get_lines_list(!.AttachInfo),
         postpone(Config, Screen, Headers, ParsedHeaders, Text, Attachments,
-            Res, PostponeMsg, !IO),
+            !.CryptoInfo, Res, PostponeMsg, !IO),
         (
             Res = yes,
             maybe_remove_draft(!.StagingInfo, !IO),
@@ -700,7 +745,7 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
     ; KeyCode = char('Y') ->
         Attachments = get_lines_list(!.AttachInfo),
         send_mail(Config, Screen, Headers, ParsedHeaders, Text, Attachments,
-            Sent0, MessageUpdate0, !IO),
+            !.CryptoInfo, Sent0, MessageUpdate0, !IO),
         (
             Sent0 = sent,
             tag_replied_message(Config, Headers, TagRes, !IO),
@@ -752,19 +797,19 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
     (
         Action = continue,
         staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo,
-            Transition, !IO)
+            Transition, !CryptoInfo, !IO)
     ;
         Action = resize,
         resize_staging_screen(Screen, NewScreen, !.StagingInfo, !PagerInfo,
             !IO),
         staging_screen(NewScreen, !.StagingInfo, !.AttachInfo, !.PagerInfo,
-            Transition, !IO)
+            Transition, !CryptoInfo, !IO)
     ;
         Action = edit,
         EditAttachments = get_lines_list(!.AttachInfo),
         % XXX make this tail-recursive in hlc
-        create_edit_stage(Config, Screen, Headers, Text, EditAttachments,
-            MaybeOldDraft, Transition, !IO)
+        create_edit_stage_2(Config, Screen, Headers, Text, EditAttachments,
+            MaybeOldDraft, Transition, !CryptoInfo, !IO)
     ;
         Action = leave(Sent, TransitionMessage),
         Transition = screen_transition(Sent, TransitionMessage)
@@ -788,9 +833,10 @@ resize_staging_screen(Screen0, Screen, StagingInfo, PagerInfo0, PagerInfo,
 %-----------------------------------------------------------------------------%
 
 :- pred edit_header(screen::in, header_type::in,
-    staging_info::in, staging_info::out, io::di, io::uo) is det.
+    staging_info::in, staging_info::out, crypto_info::in, crypto_info::out,
+    io::di, io::uo) is det.
 
-edit_header(Screen, HeaderType, !StagingInfo, !IO) :-
+edit_header(Screen, HeaderType, !StagingInfo, !CryptoInfo, !IO) :-
     Config = !.StagingInfo ^ si_config,
     Headers0 = !.StagingInfo ^ si_headers,
     get_header(HeaderType, Headers0, Prompt, Initial, CompleteAddressbook),
@@ -817,7 +863,8 @@ edit_header(Screen, HeaderType, !StagingInfo, !IO) :-
         update_header(Config, backslash_quote_meta_chars, HeaderType, Value,
             Headers0, Headers, ParsedHeaders0, ParsedHeaders, !IO),
         !StagingInfo ^ si_headers := Headers,
-        !StagingInfo ^ si_parsed_hdrs := ParsedHeaders
+        !StagingInfo ^ si_parsed_hdrs := ParsedHeaders,
+        maintain_encrypt_keys(ParsedHeaders, !CryptoInfo, !IO)
     ;
         Return = no
     ).
@@ -866,6 +913,16 @@ update_header(Config, Opt, HeaderType, Input, !Headers, !Parsed, !IO) :-
         HeaderType = subject,
         !Headers ^ h_subject := Input
     ).
+
+%-----------------------------------------------------------------------------%
+
+:- pred toggle_encrypt(staging_info::in, staging_info::out,
+    crypto_info::in, crypto_info::out, io::di, io::uo) is det.
+
+toggle_encrypt(!StagingInfo, !CryptoInfo, !IO) :-
+    !CryptoInfo ^ ci_encrypt := not(!.CryptoInfo ^ ci_encrypt),
+    ParsedHeaders = !.StagingInfo ^ si_parsed_hdrs,
+    maintain_encrypt_keys(ParsedHeaders, !CryptoInfo, !IO).
 
 %-----------------------------------------------------------------------------%
 
@@ -1124,7 +1181,7 @@ accept_media_type(String) :-
 split_panels(Screen, HeaderPanels, AttachmentPanels, MaybeSepPanel,
         PagerPanels) :-
     get_main_panels(Screen, Panels0),
-    list.split_upto(6, Panels0, HeaderPanels, Panels1),
+    list.split_upto(7, Panels0, HeaderPanels, Panels1),
     list.split_upto(3, Panels1, AttachmentPanels, Panels2),
     (
         Panels2 = [SepPanel | PagerPanels],
@@ -1135,76 +1192,92 @@ split_panels(Screen, HeaderPanels, AttachmentPanels, MaybeSepPanel,
         PagerPanels = []
     ).
 
-:- pred draw_header_lines(list(panel)::in, compose_attrs::in, headers::in,
-    parsed_headers::in, io::di, io::uo) is det.
+:- pred draw_header_lines(list(panel)::in, compose_attrs::in,
+    headers::in, parsed_headers::in, crypto_info::in, io::di, io::uo) is det.
 
-draw_header_lines(!.Panels, Attrs, Headers, Parsed, !IO) :-
-    hdr(!Panels, Attrs, "    From", draw_addresses, Parsed ^ ph_from, !IO),
-    hdr(!Panels, Attrs, "      To", draw_addresses, Parsed ^ ph_to, !IO),
-    hdr(!Panels, Attrs, "      Cc", draw_addresses, Parsed ^ ph_cc, !IO),
-    hdr(!Panels, Attrs, "     Bcc", draw_addresses, Parsed ^ ph_bcc, !IO),
-    hdr(!Panels, Attrs, " Subject", draw_unstruct, Headers ^ h_subject, !IO),
-    hdr(!Panels, Attrs, "Reply-To", draw_addresses, Parsed ^ ph_replyto, !IO),
-    !.Panels = _.
+draw_header_lines(!.Panels, Attrs, Headers, Parsed, CryptoInfo, !IO) :-
+    Attr = Attrs ^ c_generic ^ field_name,
+    DrawFrom = draw_addresses(option(yes), Attrs, CryptoInfo),
+    DrawRecip = draw_addresses(option(yes), Attrs, CryptoInfo),
+    DrawReplyTo = draw_addresses(option(no), Attrs, CryptoInfo),
+    DrawUnstruct = draw_unstruct(Attrs),
+    hdr(!Panels, Attr, "    From", DrawFrom, Parsed ^ ph_from, !IO),
+    hdr(!Panels, Attr, "      To", DrawRecip, Parsed ^ ph_to, !IO),
+    hdr(!Panels, Attr, "      Cc", DrawRecip, Parsed ^ ph_cc, !IO),
+    hdr(!Panels, Attr, "     Bcc", DrawRecip, Parsed ^ ph_bcc, !IO),
+    hdr(!Panels, Attr, " Subject", DrawUnstruct, Headers ^ h_subject, !IO),
+    hdr(!Panels, Attr, "Reply-To", DrawReplyTo, Parsed ^ ph_replyto, !IO),
+    (
+        !.Panels = []
+    ;
+        !.Panels = [CryptoPanel | _],
+        draw_crypto_line(Attrs, CryptoPanel, CryptoInfo, !IO)
+    ).
 
-:- pred hdr(list(panel), list(panel), compose_attrs, string,
-    pred(compose_attrs, panel, T, io, io), T, io, io).
-:- mode hdr(in, out, in, in,
-    in(pred(in, in, in, di, uo) is det), in, di, uo) is det.
+:- pred hdr(list(panel), list(panel), attr, string, pred(panel, T, io, io), T,
+    io, io).
+:- mode hdr(in, out, in, in, pred(in, in, di, uo) is det, in, di, uo) is det.
 
-hdr(Panels0, Panels, Attrs, FieldName, DrawValue, Value, !IO) :-
+hdr(Panels0, Panels, Attr, FieldName, DrawValue, Value, !IO) :-
     (
         Panels0 = [],
         Panels = []
     ;
         Panels0 = [Panel | Panels],
-        draw_header_field(Attrs, Panel, FieldName, !IO),
-        DrawValue(Attrs, Panel, Value, !IO)
+        panel.erase(Panel, !IO),
+        draw(Panel, Attr, FieldName, !IO),
+        draw(Panel, ": ", !IO),
+        DrawValue(Panel, Value, !IO)
     ).
 
-:- pred draw_header_field(compose_attrs::in, panel::in, string::in,
+:- pred draw_unstruct(compose_attrs::in, panel::in, header_value::in,
     io::di, io::uo) is det.
 
-draw_header_field(Attrs, Panel, FieldName, !IO) :-
-    panel.erase(Panel, !IO),
-    draw(Panel, Attrs ^ c_generic ^ field_name, FieldName, !IO),
-    draw(Panel, ": ", !IO).
+draw_unstruct(Attrs, Panel, Value, !IO) :-
+    String = header_value_string(Value),
+    draw(Panel, Attrs ^ c_generic ^ field_body, String, !IO).
 
-:- pred draw_list(pred(compose_attrs, panel, T, io, io), compose_attrs, panel,
-    list(T), io, io).
-:- mode draw_list(in(pred(in, in, in, di, uo) is det), in, in,
-    in, di, uo) is det.
+:- pred draw_list(pred(panel, T, io, io), panel, attr, list(T), io, io).
+:- mode draw_list(pred(in, in, di, uo) is det, in, in, in, di, uo) is det.
 
-draw_list(_Pred, _Attrs, _Panel, [], !IO).
-draw_list(Pred, Attrs, Panel, [H | T], !IO) :-
-    Pred(Attrs, Panel, H, !IO),
+draw_list(_Pred, _Panel, _Attr, [], !IO).
+draw_list(Pred, Panel, Attr, [H | T], !IO) :-
+    Pred(Panel, H, !IO),
     (
         T = []
     ;
         T = [_ | _],
-        draw(Panel, Attrs ^ c_generic ^ field_body, ", ", !IO),
-        draw_list(Pred, Attrs, Panel, T, !IO)
+        draw(Panel, Attr, ", ", !IO),
+        draw_list(Pred, Panel, Attr, T, !IO)
     ).
 
-:- pred draw_addresses(compose_attrs::in, panel::in, list(address)::in,
-    io::di, io::uo) is det.
+:- type draw_address_option
+    --->    option(
+                show_encrypt_key    :: bool
+            ).
 
-draw_addresses(Attrs, Panel, Addresses, !IO) :-
-    draw_list(draw_address, Attrs, Panel, Addresses, !IO).
+:- pred draw_addresses(draw_address_option::in, compose_attrs::in,
+    crypto_info::in, panel::in, list(address)::in, io::di, io::uo) is det.
 
-:- pred draw_address(compose_attrs::in, panel::in, address::in, io::di, io::uo)
-    is det.
+draw_addresses(Option, Attrs, CryptoInfo, Panel, Addresses, !IO) :-
+    Attr = Attrs ^ c_generic ^ field_body,
+    draw_list(draw_address(Option, Attrs, CryptoInfo), Panel, Attr, Addresses,
+        !IO).
 
-draw_address(Attrs, Panel, Address, !IO) :-
+:- pred draw_address(draw_address_option::in, compose_attrs::in,
+    crypto_info::in, panel::in, address::in, io::di, io::uo) is det.
+
+draw_address(Option, Attrs, CryptoInfo, Panel, Address, !IO) :-
     (
         Address = mailbox(Mailbox),
-        draw_mailbox(Attrs, Panel, Mailbox, !IO)
+        draw_mailbox(Option, Attrs, CryptoInfo, Panel, Mailbox, !IO)
     ;
         Address = group(DisplayName, Mailboxes),
         draw_display_name(Attrs, Panel, DisplayName, !IO),
         Attr = Attrs ^ c_generic ^ field_body,
         draw(Panel, Attr, ": ", !IO),
-        draw_list(draw_mailbox, Attrs, Panel, Mailboxes, !IO),
+        draw_list(draw_mailbox(Option, Attrs, CryptoInfo), Panel, Attr,
+            Mailboxes, !IO),
         draw(Panel, Attr, ";", !IO)
     ).
 
@@ -1222,20 +1295,22 @@ draw_display_name(Attrs, Panel, DisplayName, !IO) :-
     ),
     draw(Panel, Attr, String, !IO).
 
-:- pred draw_mailbox(compose_attrs::in, panel::in, mailbox::in, io::di, io::uo)
-    is det.
+:- pred draw_mailbox(draw_address_option::in, compose_attrs::in,
+    crypto_info::in, panel::in, mailbox::in, io::di, io::uo) is det.
 
-draw_mailbox(Attrs, Panel, Mailbox, !IO) :-
+draw_mailbox(Option, Attrs, CryptoInfo, Panel, Mailbox, !IO) :-
     (
         Mailbox = mailbox(yes(DisplayName), AddrSpec),
         draw_display_name(Attrs, Panel, DisplayName, !IO),
         Attr = Attrs ^ c_generic ^ field_body,
         draw(Panel, Attr, " <", !IO),
         draw_addr_spec(Attrs, Panel, AddrSpec, !IO),
-        draw(Panel, Attr, ">", !IO)
+        draw(Panel, Attr, ">", !IO),
+        draw_mailbox_crypto(Option, Attrs, CryptoInfo, Panel, AddrSpec, !IO)
     ;
         Mailbox = mailbox(no, AddrSpec),
-        draw_addr_spec(Attrs, Panel, AddrSpec, !IO)
+        draw_addr_spec(Attrs, Panel, AddrSpec, !IO),
+        draw_mailbox_crypto(Option, Attrs, CryptoInfo, Panel, AddrSpec, !IO)
     ;
         Mailbox = bad_mailbox(String),
         draw(Panel, Attrs ^ c_invalid, String, !IO)
@@ -1255,12 +1330,72 @@ draw_addr_spec(Attrs, Panel, AddrSpec, !IO) :-
     ),
     draw(Panel, Attr, String, !IO).
 
-:- pred draw_unstruct(compose_attrs::in, panel::in, header_value::in,
+:- pred draw_mailbox_crypto(draw_address_option::in, compose_attrs::in,
+    crypto_info::in, panel::in, addr_spec::in, io::di, io::uo) is det.
+
+draw_mailbox_crypto(Option, Attrs, CryptoInfo, Panel, AddrSpec, !IO) :-
+    Option = option(ShowEncryptKey),
+    CryptoInfo = crypto_info(_, Encrypt, EncryptKeys),
+    (
+        ShowEncryptKey = yes,
+        Encrypt = yes
+    ->
+        ( map.search(EncryptKeys, AddrSpec, Key) ->
+            draw_encrypt_key(Attrs, Panel, Key, !IO)
+        ;
+            draw(Panel, Attrs ^ c_bad_key, " [no key found]", !IO)
+        )
+    ;
+        true
+    ).
+
+:- pred draw_encrypt_key(compose_attrs::in, panel::in, key_userid::in,
     io::di, io::uo) is det.
 
-draw_unstruct(Attrs, Panel, Value, !IO) :-
-    String = header_value_string(Value),
-    draw(Panel, Attrs ^ c_generic ^ field_body, String, !IO).
+draw_encrypt_key(Attrs, Panel, key_userid(Key, UserId), !IO) :-
+    KeyInfo = get_key_info(Key),
+    SubKeys = KeyInfo ^ key_subkeys,
+    ( SubKeys = [SubKey | _] ->
+        string.right_by_codepoint(SubKey ^ subkey_fingerprint, 8, Fpr),
+        validity(UserId ^ uid_validity, Validity, GoodKey),
+        (
+            GoodKey = yes,
+            Attr = Attrs ^ c_good_key
+        ;
+            GoodKey = no,
+            Attr = Attrs ^ c_bad_key
+        ),
+        draw(Panel, Attr,
+            format(" [%s, validity: %s]", [s(Fpr), s(Validity)]), !IO)
+    ;
+        % Should not happen. 
+        draw(Panel, Attrs ^ c_good_key, " [bad key info]", !IO)
+    ).
+
+:- pred validity(validity::in, string::out, bool::out) is det.
+
+validity(validity_unknown, "unknown", no).
+validity(validity_undefined, "undefined", no).
+validity(validity_never, "never", no).
+validity(validity_marginal, "marginal", yes).
+validity(validity_full, "full", yes).
+validity(validity_ultimate, "ultimate", yes).
+
+:- pred draw_crypto_line(compose_attrs::in, panel::in, crypto_info::in,
+    io::di, io::uo) is det.
+
+draw_crypto_line(Attrs, Panel, CryptoInfo, !IO) :-
+    CryptoInfo ^ ci_encrypt = Encrypt,
+    (
+        Encrypt = yes,
+        Body = "encrypt"
+    ;
+        Encrypt = no,
+        Body = "none"
+    ),
+    panel.erase(Panel, !IO),
+    draw(Panel, Attrs ^ c_generic ^ field_name, "  Crypto: ", !IO),
+    draw(Panel, Attrs ^ c_generic ^ field_body, Body, !IO).
 
 :- pred draw_attachment_line(compose_attrs::in, panel::in, attachment::in,
     int::in, bool::in, io::di, io::uo) is det.
@@ -1321,8 +1456,9 @@ draw_sep_bar(Attrs, Screen, yes(Panel), !IO) :-
     Attr = Attrs ^ c_status ^ bar,
     get_cols(Screen, Cols),
     panel.erase(Panel, !IO),
-    draw(Panel, Attr, "-- (ftcbsr) edit fields; (a) attach, (d) detach, "
-        ++ "(T) edit attachment type ", !IO),
+    draw(Panel, Attr,
+        "-- (ftcbsr) edit fields; (E)ncrypt, (S)ign; " ++
+        "(a)ttach, (d)etach, media (T)ype ", !IO),
     hline(Panel, char.to_int('-'), Cols, !IO).
 
 :- pred draw_staging_bar(compose_attrs::in, screen::in, staging_info::in,
@@ -1347,27 +1483,61 @@ draw_staging_bar(Attrs, Screen, StagingInfo, !IO) :-
 %-----------------------------------------------------------------------------%
 
 :- pred postpone(prog_config::in, screen::in, headers::in, parsed_headers::in,
-    string::in, list(attachment)::in, bool::out, message_update::out,
-    io::di, io::uo) is det.
+    string::in, list(attachment)::in, crypto_info::in, bool::out,
+    message_update::out, io::di, io::uo) is det.
 
-postpone(Config, Screen, Headers, ParsedHeaders, Text, Attachments, Res,
-        MessageUpdate, !IO) :-
+postpone(Config, Screen, Headers, ParsedHeaders, Text, Attachments, CryptoInfo,
+        Res, MessageUpdate, !IO) :-
+    CryptoInfo = crypto_info(_, Encrypt, _),
+    (
+        Encrypt = yes,
+        Res = no,
+        MessageUpdate = set_warning(
+            "Cannot postpone messages with encryption.")
+    ;
+        Encrypt = no,
+        postpone_2(Config, Screen, Headers, ParsedHeaders, Text, Attachments,
+            CryptoInfo, Res, MessageUpdate, !IO)
+    ).
+
+:- pred postpone_2(prog_config::in, screen::in, headers::in, parsed_headers::in,
+    string::in, list(attachment)::in, crypto_info::in, bool::out,
+    message_update::out, io::di, io::uo) is det.
+
+postpone_2(Config, Screen, Headers, ParsedHeaders, Text, Attachments,
+        CryptoInfo, Res, MessageUpdate, !IO) :-
     create_temp_message_file(Config, prepare_postpone, Headers, ParsedHeaders,
-        Text, Attachments, ResFilename, !IO),
+        Text, Attachments, CryptoInfo, ResFilename, Warnings, !IO),
     (
         ResFilename = ok(Filename),
-        update_message_immed(Screen, set_info("Postponing message..."), !IO),
-        add_draft(Config, Filename, DraftRes, !IO),
-        io.remove_file(Filename, _, !IO),
         (
-            DraftRes = ok,
-            MessageUpdate = set_info("Message postponed."),
-            Res = yes
+            Warnings = [],
+            Confirmation = yes
         ;
-            DraftRes = error(Error),
-            MessageUpdate = set_warning(Error),
+            Warnings = [_ | _],
+            Prompt = string.join_list(" ", Warnings) ++ " Continue? (Y/n)",
+            prompt_confirm(Screen, Prompt, Confirmation, !IO)
+        ),
+        (
+            Confirmation = yes,
+            update_message_immed(Screen, set_info("Postponing message..."),
+                !IO),
+            add_draft(Config, Filename, DraftRes, !IO),
+            (
+                DraftRes = ok,
+                MessageUpdate = set_info("Message postponed."),
+                Res = yes
+            ;
+                DraftRes = error(Error),
+                MessageUpdate = set_warning(Error),
+                Res = no
+            )
+        ;
+            Confirmation = no,
+            MessageUpdate = set_info("Message not postponed."),
             Res = no
-        )
+        ),
+        io.remove_file(Filename, _, !IO)
     ;
         ResFilename = error(Error),
         MessageUpdate = set_warning(Error),
@@ -1389,31 +1559,60 @@ maybe_remove_draft(StagingInfo, !IO) :-
 %-----------------------------------------------------------------------------%
 
 :- pred send_mail(prog_config::in, screen::in, headers::in, parsed_headers::in,
-    string::in, list(attachment)::in, sent::out, message_update::out,
-    io::di, io::uo) is det.
+    string::in, list(attachment)::in, crypto_info::in, sent::out,
+    message_update::out, io::di, io::uo) is det.
 
-send_mail(Config, Screen, Headers, ParsedHeaders, Text, Attachments, Res,
-        MessageUpdate, !IO) :-
+send_mail(Config, Screen, Headers, ParsedHeaders, Text, Attachments,
+        CryptoInfo, Res, MessageUpdate, !IO) :-
     create_temp_message_file(Config, prepare_send, Headers, ParsedHeaders,
-        Text, Attachments, ResFilename, !IO),
+        Text, Attachments, CryptoInfo, ResFilename, Warnings, !IO),
     (
         ResFilename = ok(Filename),
-        update_message_immed(Screen, set_info("Sending message..."), !IO),
-        call_send_mail(Config, Filename, SendRes, !IO),
-        io.remove_file(Filename, _, !IO),
         (
-            SendRes = ok,
-            MessageUpdate = set_info("Mail sent."),
-            Res = sent
+            Warnings = [],
+            Confirmation = yes
         ;
-            SendRes = error(Message),
-            MessageUpdate = set_warning(Message),
+            Warnings = [_ | _],
+            Prompt = string.join_list(" ", Warnings) ++ " Continue? (Y/n)",
+            prompt_confirm(Screen, Prompt, Confirmation, !IO)
+        ),
+        (
+            Confirmation = yes,
+            update_message_immed(Screen, set_info("Sending message..."), !IO),
+            call_send_mail(Config, Filename, SendRes, !IO),
+            (
+                SendRes = ok,
+                MessageUpdate = set_info("Mail sent."),
+                Res = sent
+            ;
+                SendRes = error(Message),
+                MessageUpdate = set_warning(Message),
+                Res = not_sent
+            )
+        ;
+            Confirmation = no,
+            MessageUpdate = set_info("Message not sent."),
             Res = not_sent
-        )
+        ),
+        io.remove_file(Filename, _, !IO)
     ;
         ResFilename = error(Error),
         MessageUpdate = set_warning(Error),
         Res = not_sent
+    ).
+
+:- pred prompt_confirm(screen::in, string::in, bool::out, io::di, io::uo)
+    is det.
+
+prompt_confirm(Screen, Prompt, Res, !IO) :-
+    update_message_immed(Screen, set_prompt(Prompt), !IO),
+    get_keycode_blocking(KeyCode, !IO),
+    ( KeyCode = char('Y') ->
+        Res = yes
+    ; KeyCode = char('y') ->
+        Res = yes
+    ;
+        Res = no
     ).
 
 :- pred call_send_mail(prog_config::in, string::in, call_res::out,
@@ -1507,46 +1706,55 @@ tag_replied_message(Config, Headers, Res, !IO) :-
 
 :- pred create_temp_message_file(prog_config::in, prepare_temp::in,
     headers::in, parsed_headers::in, string::in, list(attachment)::in,
-    maybe_error(string)::out, io::di, io::uo) is det.
+    crypto_info::in, maybe_error(string)::out, list(string)::out,
+    io::di, io::uo) is det.
 
 create_temp_message_file(Config, Prepare, Headers, ParsedHeaders, Text,
-        Attachments, Res, !IO) :-
+        Attachments, CryptoInfo, Res, Warnings, !IO) :-
+    time(Time, !IO),
+    time_to_int(Time, Seed),
+    random.init(Seed, RS0),
     generate_date_msg_id(Date, MessageId, !IO),
-    generate_boundary(Boundary, !IO),
+    generate_boundary(BoundaryA, RS0, RS1),
     generate_message_spec(Prepare, Headers, ParsedHeaders, Date, MessageId,
-        boundary(Boundary), Text, Attachments, Spec),
-    create_temp_message_file_2(Config, Prepare, Spec, Res, !IO).
-
-:- pred create_temp_message_file_2(prog_config::in, prepare_temp::in,
-    message_spec::in, maybe_error(string)::out, io::di, io::uo) is det.
-
-create_temp_message_file_2(Config, Prepare, Spec, Res, !IO) :-
-    io.make_temp(Filename, !IO),
-    io.open_output(Filename, ResOpen, !IO),
+        boundary(BoundaryA), Text, Attachments, Spec0),
     (
-        ResOpen = ok(Stream),
-        write_message(Stream, Config, Spec, allow_header_error(Prepare),
-            ResWrite, !IO),
-        io.close_output(Stream, !IO),
+        Prepare \= prepare_edit,
+        CryptoInfo ^ ci_encrypt = yes
+    ->
+        Spec0 = message_spec(WriteHeaders, MessageType),
+        get_encrypt_keys(CryptoInfo, ParsedHeaders, Keys, Missing),
         (
-            ResWrite = ok,
-            Res = ok(Filename)
+            Keys = [],
+            Res = error("No encryption keys available."),
+            Warnings = []
         ;
-            ResWrite = error(Error),
-            io.remove_file(Filename, _, !IO),
-            Res = error(Error)
+            Keys = [_ | _],
+            missing_keys_warning(Missing, WarningsA),
+            % XXX encrypt could return Cipher as a data buffer instead of
+            % returning it as a string
+            encrypt(CryptoInfo, Keys, Config, MessageType, ResCipher,
+                WarningsB, !IO),
+            (
+                ResCipher = ok(Cipher),
+                generate_boundary(BoundaryB, RS1, _RS),
+                generate_multipart_encrypted(Cipher, boundary(BoundaryB),
+                    MimeMessage),
+                Spec = message_spec(WriteHeaders, mime(MimeMessage)),
+                write_temp_message_file(Config, Prepare, Spec, Res, !IO),
+                Warnings = WarningsA ++ WarningsB
+            ;
+                ResCipher = error(Error),
+                Res = error("Encryption failed: " ++ Error),
+                Warnings = []
+            )
         )
     ;
-        ResOpen = error(_Error),
-        Message = "Error writing temporary file " ++ Filename,
-        Res = error(Message)
+        write_temp_message_file(Config, Prepare, Spec0, Res, !IO),
+        Warnings = []
     ).
 
-:- func allow_header_error(prepare_temp) = bool.
-
-allow_header_error(prepare_send) = no.
-allow_header_error(prepare_edit) = yes.
-allow_header_error(prepare_postpone) = yes.
+%-----------------------------------------------------------------------------%
 
 :- pred generate_message_spec(prepare_temp::in, headers::in,
     parsed_headers::in, header_value::in, header_value::in, boundary::in,
@@ -1561,7 +1769,7 @@ generate_message_spec(Prepare, Headers, ParsedHeaders, Date, MessageId,
         ; Prepare = prepare_postpone
         ),
         % XXX detect charset
-        TextPart = discrete(text_plain(yes(utf8)), inline, cte_8bit,
+        TextPart = discrete(text_plain(yes(utf8)), yes(inline), yes(cte_8bit),
             text(Text)),
         (
             Attachments = [],
@@ -1570,8 +1778,8 @@ generate_message_spec(Prepare, Headers, ParsedHeaders, Date, MessageId,
         ;
             Attachments = [_ | _],
             MimeMessage = mime_message(mime_version_1_0, MultiPart),
-            MultiPart = composite(multipart_mixed, Boundary, inline, cte_8bit,
-                [TextPart | AttachmentParts]),
+            MultiPart = composite(multipart_mixed, Boundary, yes(inline),
+                yes(cte_8bit), [TextPart | AttachmentParts]),
             list.map(generate_attachment_mime_part, Attachments,
                 AttachmentParts)
         ),
@@ -1677,23 +1885,22 @@ generate_attachment_mime_part(Attachment, MimePart) :-
         Attachment = old_attachment(OldPart),
         OldType = OldPart ^ pt_type,
         OldContent = OldPart ^ pt_content,
-        MaybeFileName0 = OldPart ^ pt_filename,
+        MaybeFileName = OldPart ^ pt_filename,
         (
-            MaybeFileName0 = yes(FileName),
-            MaybeFileName = yes(filename(FileName))
+            MaybeFileName = yes(FileName),
+            Disposition = attachment(yes(filename(FileName)))
         ;
-            MaybeFileName0 = no,
-            MaybeFileName = no
+            MaybeFileName = no,
+            Disposition = attachment(no)
         ),
         (
             OldContent = text(Text),
-            MimePart = discrete(content_type(OldType),
-                attachment(MaybeFileName), cte_8bit, text(Text))
+            MimePart = discrete(content_type(OldType), yes(Disposition),
+                yes(cte_8bit), text(Text))
         ;
             OldContent = unsupported,
-            MimePart = discrete(content_type(OldType),
-                attachment(MaybeFileName), cte_base64,
-                external_base64(OldPart))
+            MimePart = discrete(content_type(OldType), yes(Disposition),
+                yes(cte_base64), external_base64(OldPart))
         ;
             OldContent = subparts(_),
             unexpected($module, $pred, "nested part")
@@ -1703,17 +1910,78 @@ generate_attachment_mime_part(Attachment, MimePart) :-
         )
     ;
         Attachment = new_attachment(Type, Content, FileName, _Size),
-        MaybeFileName = yes(filename(FileName)),
+        Disposition = attachment(yes(filename(FileName))),
         (
             Content = text(Text),
             % XXX detect charset
-            MimePart = discrete(text_plain(yes(utf8)),
-                attachment(MaybeFileName), cte_8bit, text(Text))
+            MimePart = discrete(text_plain(yes(utf8)), yes(Disposition),
+                yes(cte_8bit), text(Text))
         ;
             Content = binary_base64(Base64),
-            MimePart = discrete(content_type(Type),
-                attachment(MaybeFileName), cte_base64, text(Base64))
+            MimePart = discrete(content_type(Type), yes(Disposition),
+                yes(cte_base64), text(Base64))
         )
+    ).
+
+:- pred generate_multipart_encrypted(string::in, boundary::in,
+    mime_message::out) is det.
+
+generate_multipart_encrypted(Cipher, Boundary, MimeMessage) :-
+    % RFC 3156
+    MimeMessage = mime_message(mime_version_1_0, MultiPart),
+    MultiPart = composite(multipart_encrypted(application_pgp_encrypted),
+        Boundary, no, no, [SubPartA, SubPartB]),
+    SubPartA = discrete(application_pgp_encrypted, no, no,
+        text("Version: 1\n")),
+    SubPartB = discrete(application_octet_stream, no, no, text(Cipher)).
+
+%-----------------------------------------------------------------------------%
+
+:- pred write_temp_message_file(prog_config::in, prepare_temp::in,
+    message_spec::in, maybe_error(string)::out, io::di, io::uo) is det.
+
+write_temp_message_file(Config, Prepare, Spec, Res, !IO) :-
+    io.make_temp(Filename, !IO),
+    io.open_output(Filename, ResOpen, !IO),
+    (
+        ResOpen = ok(Stream),
+        write_message(Stream, Config, Spec, allow_header_error(Prepare),
+            ResWrite, !IO),
+        io.close_output(Stream, !IO),
+        (
+            ResWrite = ok,
+            Res = ok(Filename)
+        ;
+            ResWrite = error(Error),
+            io.remove_file(Filename, _, !IO),
+            Res = error(Error)
+        )
+    ;
+        ResOpen = error(_Error),
+        Message = "Error writing temporary file " ++ Filename,
+        Res = error(Message)
+    ).
+
+:- func allow_header_error(prepare_temp) = bool.
+
+allow_header_error(prepare_send) = no.
+allow_header_error(prepare_edit) = yes.
+allow_header_error(prepare_postpone) = yes.
+
+:- pred missing_keys_warning(list(addr_spec)::in, list(string)::out) is det.
+
+missing_keys_warning(Missing, Warnings) :-
+    (
+        Missing = [],
+        Warnings = []
+    ;
+        Missing = [AddrSpec],
+        addr_spec_to_string(AddrSpec, AddrString, _Valid),
+        Warnings = ["Missing key for <" ++ AddrString ++ ">."]
+    ;
+        Missing = [_, _ | _],
+        Num = length(Missing),
+        Warnings = [format("Missing keys for %d addresses.", [i(Num)])]
     ).
 
 %-----------------------------------------------------------------------------%
