@@ -300,6 +300,7 @@ colour(Colour, !Tokens) :-
 
 attribute("normal", normal).
 attribute("bold", bold).
+attribute("boldreversed", bold + reverse).
 
 :- pred colour(string::in, colour::out) is semidet.
 
