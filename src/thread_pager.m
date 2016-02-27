@@ -132,6 +132,7 @@
     ;       start_reply(message, reply_kind)
     ;       prompt_resend(message_id)
     ;       start_recall
+    ;       edit_as_template(message)
     ;       prompt_tag(string)
     ;       bulk_tag(keep_selection)
     ;       prompt_save_part(part, maybe(header_value))
@@ -694,6 +695,18 @@ thread_pager_loop_2(Screen, Key, !Info, !IO) :-
         ),
         thread_pager_loop(NewScreen, !Info, !IO)
     ;
+        Action = edit_as_template(Message),
+        handle_edit_as_template(Screen, NewScreen, Message, Sent, !Info, !IO),
+        (
+            Sent = sent,
+            AddedMessages0 = !.Info ^ tp_added_messages,
+            !Info ^ tp_added_messages := AddedMessages0 + 1,
+            reopen_thread_pager(NewScreen, no, !Info, !IO)
+        ;
+            Sent = not_sent
+        ),
+        thread_pager_loop(NewScreen, !Info, !IO)
+    ;
         Action = prompt_tag(Initial),
         prompt_tag(Screen, Initial, !Info, !IO),
         thread_pager_loop(Screen, !Info, !IO)
@@ -1002,6 +1015,10 @@ thread_pager_input(Key, Action, MessageUpdate, !Info) :-
     ->
         Action = start_recall,
         MessageUpdate = no_change
+    ;
+        Key = char('E')
+    ->
+        edit_as_template(!.Info, Action, MessageUpdate)
     ;
         Key = char('a')
     ->
@@ -2098,10 +2115,13 @@ skip_to_search(SearchKind, MessageUpdate, !Info) :-
     thread_pager_info::in, thread_pager_info::out, io::di, io::uo) is det.
 
 toggle_content(Screen, ToggleType, !Info, !IO) :-
+    NumRows = !.Info ^ tp_num_pager_rows,
     get_cols(Screen, Cols),
     Pager0 = !.Info ^ tp_pager,
-    pager.toggle_content(ToggleType, Cols, MessageUpdate, Pager0, Pager, !IO),
+    pager.toggle_content(ToggleType, NumRows, Cols, MessageUpdate,
+        Pager0, Pager, !IO),
     !Info ^ tp_pager := Pager,
+    sync_thread_to_pager(!Info),
     update_message(Screen, MessageUpdate, !IO).
 
 %-----------------------------------------------------------------------------%
@@ -2217,6 +2237,7 @@ handle_resend(Screen, MessageId, !Info, !IO) :-
     update_message(Screen, MessageUpdate, !IO),
     History = History0 ^ ch_to_history := ToHistory,
     !Info ^ tp_common_history := History.
+    % XXX increment tp_added_messages?
 
 %-----------------------------------------------------------------------------%
 
@@ -2232,8 +2253,8 @@ handle_recall(!Screen, ThreadId, Sent, !Info, !IO) :-
         MaybeSelected = yes(Message),
         (
             Message = message(_, _, _, _, _, _),
-            continue_postponed(Config, Crypto, !.Screen, Message, TransitionB,
-                !IO),
+            continue_from_message(Config, Crypto, !.Screen, postponed_message,
+                Message, TransitionB, !IO),
             handle_screen_transition(!Screen, TransitionB, Sent, !Info, !IO)
         ;
             Message = excluded_message(_),
@@ -2241,6 +2262,38 @@ handle_recall(!Screen, ThreadId, Sent, !Info, !IO) :-
         )
     ;
         MaybeSelected = no,
+        Sent = not_sent
+    ).
+
+%-----------------------------------------------------------------------------%
+
+:- pred edit_as_template(thread_pager_info::in, thread_pager_action::out,
+    message_update::out) is det.
+
+edit_as_template(Info, Action, MessageUpdate) :-
+    PagerInfo = Info ^ tp_pager,
+    ( get_top_message(PagerInfo, Message) ->
+        MessageUpdate = clear_message,
+        Action = edit_as_template(Message)
+    ;
+        MessageUpdate = set_warning("No message to edit."),
+        Action = continue
+    ).
+
+:- pred handle_edit_as_template(screen::in, screen::out, message::in,
+    sent::out, thread_pager_info::in, thread_pager_info::out, io::di, io::uo)
+    is det.
+
+handle_edit_as_template(!Screen, Message, Sent, !Info, !IO) :-
+    Config = !.Info ^ tp_config,
+    Crypto = !.Info ^ tp_crypto,
+    (
+        Message = message(_, _, _, _, _, _),
+        continue_from_message(Config, Crypto, !.Screen, arbitrary_message,
+            Message, Transition, !IO),
+        handle_screen_transition(!Screen, Transition, Sent, !Info, !IO)
+    ;
+        Message = excluded_message(_),
         Sent = not_sent
     ).
 

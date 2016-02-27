@@ -36,7 +36,12 @@
     message_id::in, reply_kind::in, screen_transition(sent)::out,
     io::di, io::uo) is det.
 
-:- pred continue_postponed(prog_config::in, crypto::in, screen::in,
+:- type continue_base
+    --->    postponed_message
+    ;       arbitrary_message.
+
+:- pred continue_from_message(prog_config::in, crypto::in, screen::in,
+    continue_base::in,
     message::in(message), screen_transition(sent)::out, io::di, io::uo) is det.
 
     % Exported for resend.
@@ -395,7 +400,8 @@ start_reply_to_message_id(Config, Crypto, Screen, MessageId, ReplyKind,
 
 %-----------------------------------------------------------------------------%
 
-continue_postponed(Config, Crypto, Screen, Message, Transition, !IO) :-
+continue_from_message(Config, Crypto, Screen, ContinueBase, Message, Transition,
+        !IO) :-
     MessageId = Message ^ m_id,
     Headers0 = Message ^ m_headers,
     Tags0 = Message ^ m_tags,
@@ -421,8 +427,15 @@ continue_postponed(Config, Crypto, Screen, Message, Transition, !IO) :-
             Headers = !.Headers
         ),
         EncryptInit = contains_encrypted_tag(Tags0),
+        (
+            ContinueBase = postponed_message,
+            MaybeOldDraft = yes(MessageId)
+        ;
+            ContinueBase = arbitrary_message,
+            MaybeOldDraft = no
+        ),
         create_edit_stage(Config, Crypto, Screen, Headers, Text, Attachments,
-            yes(MessageId), EncryptInit, Transition, !IO)
+            MaybeOldDraft, EncryptInit, Transition, !IO)
     ;
         CallRes = error(Error),
         string.append_list(["Error running notmuch: ",

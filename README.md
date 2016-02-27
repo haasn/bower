@@ -100,7 +100,7 @@ The keys are:
 
     j,k,g,G, etc.   move around
     [, ]            scroll half page up, down
-    l               change search terms ("limit")
+    l, ~            change search terms ("limit")
     =               refresh search results
     Enter           open thread
     m               compose new message
@@ -199,6 +199,7 @@ This view pages through an entire thread.  The keys are:
     e               reply to everyone
     L               reply to list
     B               resend message to another address ("bounce")
+    E               use current message as a template for a new message
     R               recall postponed message
     a               add to addressbook
 

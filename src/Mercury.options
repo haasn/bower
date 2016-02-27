@@ -2,7 +2,7 @@
 MAIN_TARGET = bower
 
 # Link with curses.
-MLLIBS-bower += -lncursesw -lpanel
+MLLIBS-bower += -lncursesw -lpanelw
 
 # Build with gmime.
 GMIME = gmime-2.6

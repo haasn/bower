@@ -93,7 +93,7 @@
     --->    cycle_alternatives
     ;       toggle_expanded.
 
-:- pred toggle_content(toggle_type::in, int::in, message_update::out,
+:- pred toggle_content(toggle_type::in, int::in, int::in, message_update::out,
     pager_info::in, pager_info::out, io::di, io::uo) is det.
 
 :- pred draw_pager(pager_attrs::in, screen::in, pager_info::in, io::di, io::uo)
@@ -118,9 +118,10 @@
 :- import_module version_array.
 
 :- import_module copious_output.
+:- import_module fold_lines.
+:- import_module pager_text.
 :- import_module quote_arg.
 :- import_module string_util.
-:- import_module uri.
 
 %-----------------------------------------------------------------------------%
 
@@ -147,9 +148,13 @@
     --->    node_id - pager_line.
 
 :- type pager_line
-    --->    start_message_header(message, string, header_value)
-    ;       header(string, header_value)
-    ;       text(quote_level, string, quote_marker_end, text_type)
+    --->    header(
+                start_message   :: maybe(message),
+                continue        :: bool,
+                name            :: string,
+                value           :: string % folded (wrapped)
+            )
+    ;       text(pager_text)
     ;       part_head(
                 part            :: part,
                 alternatives    :: list(part),
@@ -161,22 +166,6 @@
                 expanded        :: bool
             )
     ;       message_separator.
-
-:- type quote_level == int.
-
-:- type quote_marker_end == int.
-
-:- type text_type
-    --->    plain
-    ;       diff(diff_line)
-    ;       url(int, int).  % (start, end] columns
-
-:- type diff_line
-    --->    diff_common
-    ;       diff_add
-    ;       diff_rem
-    ;       diff_hunk
-    ;       diff_index.
 
 :- type part_expanded
     --->    part_expanded
@@ -249,7 +238,7 @@ make_id_pager_line(NodeId, Line) = NodeId - Line.
 
 :- pred is_blank_line(pager_line::in) is semidet.
 
-is_blank_line(text(_, "", _, _)).
+is_blank_line(text(pager_text(_, "", _, _))).
 is_blank_line(message_separator).
 
 :- pred replace_node(node_id::in, tree::in, tree::in, tree::out) is det.
@@ -287,16 +276,16 @@ make_message_tree(Config, Mode, Cols, Message, Tree, !Counter, !IO) :-
     counter.allocate(NodeIdInt, !Counter),
     NodeId = node_id(NodeIdInt),
 
-    some [!RevHeaderLines] (
-        StartMessage = start_message_header(Message, "Date", Headers ^ h_date),
-        !:RevHeaderLines = [StartMessage],
-        add_header("From", Headers ^ h_from, !RevHeaderLines),
-        add_header("Subject", Headers ^ h_subject, !RevHeaderLines),
-        add_header("To", Headers ^ h_to, !RevHeaderLines),
-        maybe_add_header("Cc", Headers ^ h_cc, !RevHeaderLines),
-        maybe_add_header("Reply-To", Headers ^ h_replyto, !RevHeaderLines),
-        cons(blank_line, !RevHeaderLines),
-        HeaderTree = leaf(list.reverse(!.RevHeaderLines))
+    some [!RevLines] (
+        !:RevLines = [],
+        add_header(yes(Message), Cols, "Date", Headers ^ h_date, !RevLines),
+        add_header(no, Cols, "From", Headers ^ h_from, !RevLines),
+        add_header(no, Cols, "Subject", Headers ^ h_subject, !RevLines),
+        add_header(no, Cols, "To", Headers ^ h_to, !RevLines),
+        maybe_add_header(Cols, "Cc", Headers ^ h_cc, !RevLines),
+        maybe_add_header(Cols, "Reply-To", Headers ^ h_replyto, !RevLines),
+        cons(blank_line, !RevLines),
+        HeaderTree = leaf(list.reverse(!.RevLines))
     ),
 
     Body = Message ^ m_body,
@@ -337,20 +326,38 @@ make_message_tree(Config, Mode, Cols, Message, Tree, !Counter, !IO) :-
     ),
     Tree = node(NodeId, ReplyTrees, no).
 
-:- pred add_header(string::in, header_value::in,
+:- pred add_header(maybe(message)::in, int::in, string::in, header_value::in,
     list(pager_line)::in, list(pager_line)::out) is det.
 
-add_header(Header, Value, RevLines0, RevLines) :-
-    RevLines = [header(Header, Value) | RevLines0].
-
-:- pred maybe_add_header(string::in, header_value::in,
-    list(pager_line)::in, list(pager_line)::out) is det.
-
-maybe_add_header(Header, Value, RevLines0, RevLines) :-
-    ( empty_header_value(Value) ->
-        RevLines = RevLines0
+add_header(StartMessage, Cols, Name, Value, !RevLines) :-
+    % 2 extra columns for "Name: "
+    RemainCols = max(0, Cols - string_wcwidth(Name) - 2),
+    get_spans_by_whitespace(header_value_string(Value), Spans),
+    fill_lines(RemainCols, Spans, Folded),
+    (
+        Folded = [],
+        FoldedHead = "",
+        FoldedTail = []
     ;
-        add_header(Header, Value, RevLines0, RevLines)
+        Folded = [FoldedHead | FoldedTail]
+    ),
+    cons(header(StartMessage, no, Name, FoldedHead), !RevLines),
+    foldl(add_header_cont(Name), FoldedTail, !RevLines).
+
+:- pred add_header_cont(string::in, string::in,
+    list(pager_line)::in, list(pager_line)::out) is det.
+
+add_header_cont(Name, Value, !RevLines) :-
+    cons(header(no, yes, Name, Value), !RevLines).
+
+:- pred maybe_add_header(int::in, string::in, header_value::in,
+    list(pager_line)::in, list(pager_line)::out) is det.
+
+maybe_add_header(Cols, Header, Value, !RevLines) :-
+    ( empty_header_value(Value) ->
+        true
+    ;
+        add_header(no, Cols, Header, Value, !RevLines)
     ).
 
 :- pred make_part_tree(prog_config::in, int::in, part::in, tree::out,
@@ -372,7 +379,8 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, ExpandUnsupported, Tree,
     allocate_node_id(PartNodeId, !Counter),
     (
         Content = text(Text),
-        make_text_lines(Cols, Text, Lines),
+        make_text_lines(Cols, Text, Lines0),
+        list.map(wrap_text, Lines0) = Lines,
         fold_quote_blocks(Lines, TextTrees, !Counter),
         (
             !.ElideInitialHeadLine = yes,
@@ -450,285 +458,6 @@ hide_multipart_head_line(PartType) :-
 
 %-----------------------------------------------------------------------------%
 
-:- type append_text_context
-    --->    append_text_context(
-                % Current quote level (for wrapped lines).
-                atc_cur_quote_level     :: maybe(quote_level),
-                % Current line type (for wrapped lines).
-                atc_cur_line_type       :: maybe(text_type),
-                % Known diffs at these quote levels.
-                atc_diff_quote_levels   :: set(quote_level)
-            ).
-
-:- pred make_text_lines(int::in, string::in, list(pager_line)::out) is det.
-
-make_text_lines(Max, String, Lines) :-
-    Start = 0,
-    LastBreak = 0,
-    Cur = 0,
-    QuoteLevel = no,
-    DiffLine = no,
-    DiffQuoteLevels = set.init,
-    Context0 = append_text_context(QuoteLevel, DiffLine, DiffQuoteLevels),
-    append_text(Max, String, Start, LastBreak, Cur, Context0, _Context,
-        cord.init, LinesCord),
-    Lines = cord.list(LinesCord).
-
-:- pred append_text(int::in, string::in, int::in, int::in, int::in,
-    append_text_context::in, append_text_context::out,
-    cord(pager_line)::in, cord(pager_line)::out) is det.
-
-append_text(Max, String, Start, LastBreak, Cur, !Context, !Lines) :-
-    ( string.unsafe_index_next(String, Cur, Next, Char) ->
-        (
-            Char = '\n'
-        ->
-            append_substring(String, Start, Cur, !Context, !Lines),
-            reset_context(!Context),
-            append_text(Max, String, Next, Next, Next, !Context, !Lines)
-        ;
-            char.is_whitespace(Char)
-        ->
-            append_text(Max, String, Start, Cur, Next, !Context, !Lines)
-        ;
-            % Wrap long lines.
-            % XXX this should actually count with wcwidth
-            Next - Start > Max
-        ->
-            maybe_append_substring(String, Start, LastBreak, !Context, !Lines),
-            skip_whitespace(String, LastBreak, NextStart),
-            append_text(Max, String, NextStart, NextStart, Next, !Context,
-                !Lines)
-        ;
-            append_text(Max, String, Start, LastBreak, Next, !Context, !Lines)
-        )
-    ;
-        % End of string.
-        maybe_append_substring(String, Start, Cur, !Context, !Lines)
-    ).
-
-:- pred reset_context(append_text_context::in, append_text_context::out)
-    is det.
-
-reset_context(!Context) :-
-    !Context ^ atc_cur_quote_level := no,
-    !Context ^ atc_cur_line_type := no.
-
-:- pred maybe_append_substring(string::in, int::in, int::in,
-    append_text_context::in, append_text_context::out,
-    cord(pager_line)::in, cord(pager_line)::out) is det.
-
-maybe_append_substring(String, Start, End, !Context, !Lines) :-
-    ( End > Start ->
-        append_substring(String, Start, End, !Context, !Lines)
-    ;
-        true
-    ).
-
-:- pred append_substring(string::in, int::in, int::in,
-    append_text_context::in, append_text_context::out,
-    cord(pager_line)::in, cord(pager_line)::out) is det.
-
-append_substring(String, Start, End, Context0, Context, !Lines) :-
-    Context0 = append_text_context(MaybeQuoteLevel0, MaybeLineType0,
-        DiffQuoteLevels0),
-    string.unsafe_between(String, Start, End, SubString),
-    (
-        MaybeQuoteLevel0 = yes(QuoteLevel),
-        QuoteMarkerEnd = 0
-    ;
-        MaybeQuoteLevel0 = no,
-        detect_quote_level(SubString, 0, QuoteLevel, QuoteMarkerEnd)
-    ),
-    (
-        MaybeLineType0 = yes(diff(DiffLine))
-    ->
-        % Maintain diff line type across wrapped diff lines.
-        LineType = diff(DiffLine),
-        DiffQuoteLevels = DiffQuoteLevels0
-    ;
-        ( contains(DiffQuoteLevels0, QuoteLevel) ->
-            (
-                QuoteLevel = 0,
-                MaybeLineType0 = no,
-                detect_diff_end(String, Start)
-            ->
-                PrevDiff = no,
-                delete(QuoteLevel, DiffQuoteLevels0, DiffQuoteLevels1)
-            ;
-                PrevDiff = yes,
-                DiffQuoteLevels1 = DiffQuoteLevels0
-            )
-        ;
-            PrevDiff = no,
-            DiffQuoteLevels1 = DiffQuoteLevels0
-        ),
-        (
-            % Only detect diffs at start of line.
-            MaybeLineType0 = no,
-            detect_diff(String, Start + QuoteMarkerEnd, End, PrevDiff,
-                QuoteLevel, DiffLine)
-        ->
-            LineType = diff(DiffLine),
-            insert(QuoteLevel, DiffQuoteLevels1, DiffQuoteLevels)
-        ;
-            PrevDiff = yes
-        ->
-            LineType = diff(diff_common),
-            DiffQuoteLevels = DiffQuoteLevels0
-        ;
-            detect_url(SubString, UrlStart, UrlEnd)
-        ->
-            LineType = url(UrlStart, UrlEnd),
-            DiffQuoteLevels = DiffQuoteLevels0
-        ;
-            LineType = plain,
-            DiffQuoteLevels = DiffQuoteLevels0
-        )
-    ),
-    Text = text(QuoteLevel, SubString, QuoteMarkerEnd, LineType),
-    snoc(Text, !Lines),
-    Context = append_text_context(yes(QuoteLevel), yes(LineType),
-        DiffQuoteLevels).
-
-%-----------------------------------------------------------------------------%
-
-:- pred detect_quote_level(string::in, int::in, int::out, int::out) is det.
-
-detect_quote_level(String, Pos0, QuoteLevel, QuoteMarkerEnd) :-
-    ( quote_marker(String, Pos0, Pos1) ->
-        detect_quote_level(String, Pos1, QuoteLevel0, QuoteMarkerEnd),
-        QuoteLevel = 1 + QuoteLevel0
-    ;
-        QuoteLevel = 0,
-        QuoteMarkerEnd = Pos0
-    ).
-
-:- pred quote_marker(string::in, int::in, int::out) is semidet.
-
-quote_marker(String, !Pos) :-
-    string.unsafe_index_next(String, !Pos, Char),
-    (
-        Char = ('>')
-    ;
-        % Accept a single optional space before the quote character.
-        Char = (' '),
-        string.unsafe_index_next(String, !Pos, '>')
-    ).
-
-:- pred detect_diff(string::in, int::in, int::in, bool::in, quote_level::in,
-    diff_line::out) is semidet.
-
-detect_diff(String, I, CurLineEnd, PrevDiff, QuoteLevel, Diff) :-
-    string.unsafe_index_next(String, I, J, Char),
-    (
-        Char = ('+'),
-        (
-            PrevDiff = yes
-        ;
-            QuoteLevel > 0,
-            skip_nls(String, CurLineEnd, NextLineOffset),
-            lookahead_likely_diff(String, NextLineOffset, QuoteLevel)
-        ),
-        Diff = diff_add
-    ;
-        Char = ('-'),
-        ( J = CurLineEnd ->
-            true
-        ;
-            not dashes_or_sig_separator(String, J, CurLineEnd)
-        ),
-        (
-            PrevDiff = yes
-        ;
-            QuoteLevel > 0,
-            skip_nls(String, CurLineEnd, NextLineOffset),
-            lookahead_likely_diff(String, NextLineOffset, QuoteLevel)
-        ),
-        Diff = diff_rem
-    ;
-        Char = ('@'),
-        unsafe_substring_prefix(String, I, "@@ "),
-        Diff = diff_hunk
-    ;
-        Char = 'd',
-        unsafe_substring_prefix(String, I, "diff -"),
-        Diff = diff_index
-    ;
-        Char = 'I',
-        unsafe_substring_prefix(String, I, "Index: "),
-        Diff = diff_index
-    ).
-
-    % Quoted diffs are often missing the standard diff headers.  To help
-    % detect diff lines without diff headers, we look ahead one line (only).
-    %
-:- pred lookahead_likely_diff(string::in, int::in, quote_level::in) is semidet.
-
-lookahead_likely_diff(String, Start, ExpectedQuoteLevel) :-
-    detect_quote_level(String, Start, ExpectedQuoteLevel, QuoteMarkerEnd),
-    I = QuoteMarkerEnd,
-    string.unsafe_index_next(String, I, _, Char),
-    (
-        Char = ('+')
-    ;
-        Char = ('-')
-    ;
-        Char = ('@'),
-        unsafe_substring_prefix(String, I, "@@ ")
-    ;
-        Char = 'd',
-        unsafe_substring_prefix(String, I, "diff -")
-    ;
-        Char = 'I',
-        unsafe_substring_prefix(String, I, "Index: ")
-    ).
-
-:- pred dashes_or_sig_separator(string::in, int::in, int::in) is semidet.
-
-dashes_or_sig_separator(String, I0, End) :-
-    ( I0 < End ->
-        string.unsafe_index_next(String, I0, I1, Char),
-        (
-            Char = ('-'),
-            dashes_or_sig_separator(String, I1, End)
-        ;
-            Char = (' '),
-            I1 = End
-        )
-    ;
-        true
-    ).
-
-:- pred skip_nls(string::in, int::in, int::out) is det.
-
-skip_nls(String, I0, I) :-
-    ( string.unsafe_index_next(String, I0, I1, Char) ->
-        ( Char = ('\n') ->
-            skip_nls(String, I1, I)
-        ;
-            I = I0
-        )
-    ;
-        I = I0
-    ).
-
-:- pred detect_diff_end(string::in, int::in) is semidet.
-
-detect_diff_end(String, Start) :-
-    % At quote level zero diffs are likely posted in full and have a limited
-    % set of initial characters.
-    string.unsafe_index_next(String, Start, _, Char),
-    Char \= ('+'),
-    Char \= ('-'),
-    Char \= (' '),
-    Char \= ('@'),
-    Char \= ('d'),
-    Char \= ('I'),
-    Char \= ('i').
-
-%-----------------------------------------------------------------------------%
-
 :- pred fold_quote_blocks(list(pager_line)::in, list(tree)::out,
     counter::in, counter::out) is det.
 
@@ -775,11 +504,10 @@ is_not_quoted_text(Line) :-
 is_quoted_text(Line) :-
     require_complete_switch [Line]
     (
-        Line = text(Level, _, _, _),
+        Line = text(pager_text(Level, _, _, _)),
         Level > 0
     ;
-        ( Line = start_message_header(_, _, _)
-        ; Line = header(_, _)
+        ( Line = header(_, _, _, _)
         ; Line = part_head(_, _, _)
         ; Line = fold_marker(_, _)
         ; Line = message_separator
@@ -830,7 +558,7 @@ add_encapsulated_header(Header, Value, RevLines0, RevLines) :-
     ( ValueString = "" ->
         RevLines = RevLines0
     ;
-        Line = text(0, Header ++ ": " ++ ValueString, 0, plain),
+        Line = text(pager_text(0, Header ++ ": " ++ ValueString, 0, plain)),
         RevLines = [Line | RevLines0]
     ).
 
@@ -878,7 +606,7 @@ make_unsupported_part_tree(Config, Cols, PartNodeId, Part, ExpandUnsupported,
         TextLines = []
     ),
     HeadLine = part_head(Part, AltParts, Expanded),
-    Lines = [HeadLine | TextLines],
+    Lines = [HeadLine | wrap_texts(TextLines)],
     Tree = node(PartNodeId, [leaf(Lines)], yes).
 
 :- func expand_unsupported_default(bool) = part_expanded.
@@ -907,13 +635,21 @@ maybe_filter_command(Config, IsHtml) = MaybeFilterCommand :-
 
 :- func blank_line = pager_line.
 
-blank_line = text(0, "", 0, plain).
+blank_line = text(pager_text(0, "", 0, plain)).
+
+:- func wrap_texts(list(pager_text)) = list(pager_line).
+
+wrap_texts(Texts) = map(wrap_text, Texts).
+
+:- func wrap_text(pager_text) = pager_line.
+
+wrap_text(Text) = text(Text).
 
 %-----------------------------------------------------------------------------%
 
 setup_pager_for_staging(Config, Cols, Text, RetainPagerPos, Info) :-
     make_text_lines(Cols, Text, Lines0),
-    Lines = Lines0 ++ [
+    Lines = wrap_texts(Lines0) ++ [
         message_separator,
         message_separator,
         message_separator
@@ -1157,7 +893,7 @@ goto_end(NumRows, !Info) :-
 
 :- pred is_message_start(id_pager_line::in) is semidet.
 
-is_message_start(_Id - start_message_header(_, _, _)).
+is_message_start(_Id - header(yes(_), _, _, _)).
 
 skip_quoted_text(MessageUpdate, !Info) :-
     Scrollable0 = !.Info ^ p_scrollable,
@@ -1184,12 +920,12 @@ is_quoted_text_or_message_start(_Id - Line) :-
 is_quoted_text_or_message_start_2(Line) :-
     require_complete_switch [Line]
     (
-        Line = start_message_header(_, _, _)
+        Line = header(yes(_), _, _, _)
     ;
-        Line = text(Level, _, _, _),
+        Line = text(pager_text(Level, _, _, _)),
         Level > 0
     ;
-        ( Line = header(_, _)
+        ( Line = header(no, _, _, _)
         ; Line = part_head(_, _, _)
         ; Line = fold_marker(_, _)
         ; Line = message_separator
@@ -1221,7 +957,7 @@ get_top_message(Info, Message) :-
 get_top_message_2(Lines, I, J, Message) :-
     ( I >= 0 ->
         version_array.lookup(Lines, I) = _Id - Line,
-        ( Line = start_message_header(Message0, _, _) ->
+        ( Line = header(yes(Message0), _, _, _) ->
             J = I,
             Message = Message0
         ;
@@ -1259,7 +995,7 @@ skip_to_message(MessageId, !Info) :-
     is semidet.
 
 is_message_start(MessageId, _Id - Line) :-
-    Line = start_message_header(Message, _, _),
+    Line = header(yes(Message), _, _, _),
     Message ^ m_id = MessageId.
 
 %-----------------------------------------------------------------------------%
@@ -1332,22 +1068,18 @@ id_pager_line_matches_search(Search, _Id - Line) :-
 line_matches_search(Search, Line) :-
     require_complete_switch [Line]
     (
-        Line = start_message_header(Message, _, Value),
+        Line = header(StartMessage, _Cont, _, String),
         (
-            String = header_value_string(Value),
             strcase_str(String, Search)
         ;
             % XXX this won't match current tags
+            StartMessage = yes(Message),
             Tags = Message ^ m_tags,
             set.member(tag(TagName), Tags),
             strcase_str(TagName, Search)
         )
     ;
-        Line = header(_, Value),
-        String = header_value_string(Value),
-        strcase_str(String, Search)
-    ;
-        Line = text(_, String, _, _),
+        Line = text(pager_text(_, String, _, _)),
         strcase_str(String, Search)
     ;
         Line = part_head(Part, _, _),
@@ -1411,14 +1143,14 @@ do_highlight(Highlightable, NumRows, !Info) :-
 
 is_highlightable_minor(_Id - Line) :-
     ( Line = part_head(_, _, _)
-    ; Line = text(_, _, _, url(_, _))
+    ; Line = text(pager_text(_, _, _, url(_, _)))
     ; Line = fold_marker(_, _)
     ).
 
 :- pred is_highlightable_major(id_pager_line::in) is semidet.
 
 is_highlightable_major(_Id - Line) :-
-    ( Line = start_message_header(_, _, _)
+    ( Line = header(yes(_), _, _, _)
     ; Line = part_head(_, _, _)
     ).
 
@@ -1427,7 +1159,7 @@ get_highlighted_thing(Info, Thing) :-
     get_cursor_line(Scrollable, _, _NodeId - Line),
     require_complete_switch [Line]
     (
-        Line = start_message_header(Message, _, _),
+        Line = header(yes(Message), _, _, _),
         MessageId = Message ^ m_id,
         Subject = Message ^ m_headers ^ h_subject,
         PartId = 0,
@@ -1440,14 +1172,14 @@ get_highlighted_thing(Info, Thing) :-
         MaybeSubject = no,
         Thing = highlighted_part(Part, MaybeSubject)
     ;
-        Line = text(_, String, _, url(Start, End)),
+        Line = text(pager_text(_, String, _, url(Start, End))),
         string.between(String, Start, End, Url),
         Thing = highlighted_url(Url)
     ;
         Line = fold_marker(_, _),
         Thing = highlighted_fold_marker
     ;
-        Line = header(_, _),
+        Line = header(no, _, _, _),
         fail
     ;
         Line = message_separator,
@@ -1456,31 +1188,32 @@ get_highlighted_thing(Info, Thing) :-
 
 %-----------------------------------------------------------------------------%
 
-toggle_content(ToggleType, Cols, MessageUpdate, Info0, Info, !IO) :-
-    Scrollable0 = Info0 ^ p_scrollable,
+toggle_content(ToggleType, NumRows, Cols, MessageUpdate, !Info, !IO) :-
+    Scrollable0 = !.Info ^ p_scrollable,
     ( get_cursor_line(Scrollable0, _Cursor, IdLine) ->
-        toggle_line(ToggleType, Cols, IdLine, MessageUpdate, Info0, Info, !IO)
+        toggle_line(ToggleType, NumRows, Cols, IdLine, MessageUpdate,
+            !Info, !IO)
     ;
-        Info = Info0,
         MessageUpdate = clear_message
     ).
 
-:- pred toggle_line(toggle_type::in, int::in, id_pager_line::in,
+:- pred toggle_line(toggle_type::in, int::in, int::in, id_pager_line::in,
     message_update::out, pager_info::in, pager_info::out, io::di, io::uo)
     is det.
 
-toggle_line(ToggleType, Cols, NodeId - Line, MessageUpdate, !Info, !IO) :-
+toggle_line(ToggleType, NumRows, Cols, NodeId - Line, MessageUpdate,
+        !Info, !IO) :-
     (
         Line = part_head(_, _, _),
-        toggle_part(ToggleType, Cols, NodeId, Line, MessageUpdate, !Info, !IO)
+        toggle_part(ToggleType, NumRows, Cols, NodeId, Line, MessageUpdate,
+            !Info, !IO)
     ;
         Line = fold_marker(_, _),
-        toggle_folding(NodeId, Line, !Info),
+        toggle_folding(NumRows, NodeId, Line, !Info),
         MessageUpdate = clear_message
     ;
-        ( Line = start_message_header(_, _, _)
-        ; Line = header(_, _)
-        ; Line = text(_, _, _, _)
+        ( Line = header(_, _, _, _)
+        ; Line = text(pager_text(_, _, _, _))
         ; Line = message_separator
         ),
         MessageUpdate = clear_message
@@ -1489,11 +1222,12 @@ toggle_line(ToggleType, Cols, NodeId - Line, MessageUpdate, !Info, !IO) :-
 :- inst part_head
     --->    part_head(ground, ground, ground).
 
-:- pred toggle_part(toggle_type::in, int::in, node_id::in,
+:- pred toggle_part(toggle_type::in, int::in, int::in, node_id::in,
     pager_line::in(part_head), message_update::out,
     pager_info::in, pager_info::out, io::di, io::uo) is det.
 
-toggle_part(ToggleType, Cols, NodeId, Line, MessageUpdate, Info0, Info, !IO) :-
+toggle_part(ToggleType, NumRows, Cols, NodeId, Line, MessageUpdate,
+        Info0, Info, !IO) :-
     Line = part_head(Part0, HiddenParts0, Expanded0),
     (
         ToggleType = cycle_alternatives,
@@ -1506,21 +1240,22 @@ toggle_part(ToggleType, Cols, NodeId, Line, MessageUpdate, Info0, Info, !IO) :-
             force(Expanded0), NewNode, no, _ElideInitialHeadLine,
             Counter0, Counter, !IO),
         replace_node(NodeId, NewNode, Tree0, Tree),
-        scrollable.reinit(flatten(Tree), Scrollable0, Scrollable),
+        scrollable.reinit(flatten(Tree), NumRows, Scrollable0, Scrollable),
         Info = pager_info(Config, Tree, Counter, Scrollable),
         Type = Part ^ pt_type,
         MessageUpdate = set_info("Showing " ++ Type ++ " alternative.")
     ;
         % Fallback.
-        toggle_part_expanded(Cols, NodeId, Line, MessageUpdate, Info0, Info,
-            !IO)
+        toggle_part_expanded(NumRows, Cols, NodeId, Line, MessageUpdate,
+            Info0, Info, !IO)
     ).
 
-:- pred toggle_part_expanded(int::in, node_id::in, pager_line::in(part_head),
-    message_update::out, pager_info::in, pager_info::out, io::di, io::uo)
-    is det.
+:- pred toggle_part_expanded(int::in, int::in, node_id::in,
+    pager_line::in(part_head), message_update::out,
+    pager_info::in, pager_info::out, io::di, io::uo) is det.
 
-toggle_part_expanded(Cols, NodeId, Line0, MessageUpdate, Info0, Info, !IO) :-
+toggle_part_expanded(NumRows, Cols, NodeId, Line0, MessageUpdate, Info0, Info,
+        !IO) :-
     Line0 = part_head(Part, HiddenParts, Expanded0),
     (
         Expanded0 = part_expanded,
@@ -1546,16 +1281,16 @@ toggle_part_expanded(Cols, NodeId, Line0, MessageUpdate, Info0, Info, !IO) :-
         replace_node(NodeId, NewNode, Tree0, Tree),
         Counter = Counter0
     ),
-    scrollable.reinit(flatten(Tree), Scrollable0, Scrollable),
+    scrollable.reinit(flatten(Tree), NumRows, Scrollable0, Scrollable),
     Info = pager_info(Config, Tree, Counter, Scrollable).
 
 :- inst fold_marker
     --->    fold_marker(ground, ground).
 
-:- pred toggle_folding(node_id::in, pager_line::in(fold_marker),
+:- pred toggle_folding(int::in, node_id::in, pager_line::in(fold_marker),
     pager_info::in, pager_info::out) is det.
 
-toggle_folding(NodeId, Line, Info0, Info) :-
+toggle_folding(NumRows, NodeId, Line, Info0, Info) :-
     Line = fold_marker(Content, Expanded0),
     (
         Expanded0 = no,
@@ -1570,7 +1305,7 @@ toggle_folding(NodeId, Line, Info0, Info) :-
 
     Info0 = pager_info(Config, Tree0, Counter, Scrollable0),
     replace_node(NodeId, NewNode, Tree0, Tree),
-    scrollable.reinit(flatten(Tree), Scrollable0, Scrollable),
+    scrollable.reinit(flatten(Tree), NumRows, Scrollable0, Scrollable),
     Info = pager_info(Config, Tree, Counter, Scrollable).
 
 %-----------------------------------------------------------------------------%
@@ -1595,28 +1330,32 @@ draw_id_pager_line(Attrs, Panel, _Id - Line, _LineNr, IsCursor, !IO) :-
 draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
     GAttrs = Attrs ^ p_generic,
     (
-        ( Line = start_message_header(_Message, Header, Value)
-        ; Line = header(Header, Value)
-        ),
+        Line = header(_, Continue, Name, Value),
         attr(Panel, GAttrs ^ field_name, !IO),
-        draw(Panel, "| ", !IO),
-        draw(Panel, Header, !IO),
-        draw(Panel, ": ", !IO),
+        (
+            Continue = no,
+            draw(Panel, Name, !IO),
+            draw(Panel, ": ", !IO)
+        ;
+            Continue = yes,
+            getyx(Panel, Y, X, !IO),
+            move(Panel, Y, X + string_wcwidth(Name) + 2, !IO)
+        ),
         BodyAttr = GAttrs ^ field_body,
         (
             IsCursor = yes,
             Highlight = reverse
         ;
             IsCursor = no,
-            ( Header = "Subject" ->
+            ( Name = "Subject" ->
                 Highlight = bold
             ;
                 Highlight = normal
             )
         ),
-        draw(Panel, BodyAttr + Highlight, header_value_string(Value), !IO)
+        draw(Panel, BodyAttr + Highlight, Value, !IO)
     ;
-        Line = text(QuoteLevel, Text, QuoteMarkerEnd, TextType),
+        Line = text(pager_text(QuoteLevel, Text, QuoteMarkerEnd, TextType)),
         Attr0 = quote_level_to_attr(Attrs, QuoteLevel),
         (
             IsCursor = yes,
