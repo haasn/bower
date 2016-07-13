@@ -5,7 +5,6 @@
 :- interface.
 
 :- import_module bool.
-:- import_module cord.
 :- import_module list.
 :- import_module map.
 :- import_module maybe.
@@ -161,9 +160,7 @@
 
 :- pred is_multipart_signed(part::in) is semidet.
 
-:- pred is_appplication_pgp_encrypted(part::in) is semidet.
-
-:- pred snoc(T::in, cord(T)::in, cord(T)::out) is det.
+:- pred is_application_pgp_encrypted(part::in) is semidet.
 
 %-----------------------------------------------------------------------------%
 %-----------------------------------------------------------------------------%
@@ -208,10 +205,8 @@ get_replies(excluded_message(Replies)) = Replies.
 is_multipart_signed(Part) :-
     strcase_equal(Part ^ pt_type, "multipart/signed").
 
-is_appplication_pgp_encrypted(Part) :-
+is_application_pgp_encrypted(Part) :-
     strcase_equal(Part ^ pt_type, "application/pgp-encrypted").
-
-snoc(X, C, snoc(C, X)).
 
 %-----------------------------------------------------------------------------%
 % vim: ft=mercury ts=4 sts=4 sw=4 et

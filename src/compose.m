@@ -77,6 +77,7 @@
 :- import_module gpgme.
 :- import_module gpgme.key.
 :- import_module maildir.
+:- import_module make_temp.
 :- import_module message_file.
 :- import_module mime_type.
 :- import_module pager.
@@ -474,7 +475,7 @@ first_text_part([Part | Parts], Text, AttachmentParts) :-
             first_text_part(SubParts, Text, AttachmentParts)
         ;
             Encryption = decryption_good,
-            filter(isnt(is_appplication_pgp_encrypted),
+            filter(isnt(is_application_pgp_encrypted),
                 SubParts, OtherSubParts),
             first_text_part(OtherSubParts, Text, AttachmentParts)
         )
@@ -2209,25 +2210,31 @@ generate_multipart_signed(SignedPart, Sig, MicAlg, MultiPart, !RS) :-
     message_spec::in, maybe_error(string)::out, io::di, io::uo) is det.
 
 write_temp_message_file(Config, Prepare, Spec, Res, !IO) :-
-    io.make_temp(Filename, !IO),
-    io.open_output(Filename, ResOpen, !IO),
+    make_temp_suffix("", Res0, !IO),
     (
-        ResOpen = ok(Stream),
-        write_message(Stream, Config, Spec, allow_header_error(Prepare),
-            ResWrite, !IO),
-        io.close_output(Stream, !IO),
+        Res0 = ok(Filename),
+        io.open_output(Filename, ResOpen, !IO),
         (
-            ResWrite = ok,
-            Res = ok(Filename)
+            ResOpen = ok(Stream),
+            write_message(Stream, Config, Spec, allow_header_error(Prepare),
+                ResWrite, !IO),
+            io.close_output(Stream, !IO),
+            (
+                ResWrite = ok,
+                Res = ok(Filename)
+            ;
+                ResWrite = error(Error),
+                io.remove_file(Filename, _, !IO),
+                Res = error(Error)
+            )
         ;
-            ResWrite = error(Error),
+            ResOpen = error(_Error),
             io.remove_file(Filename, _, !IO),
-            Res = error(Error)
+            Res = error("Error writing temporary file " ++ Filename)
         )
     ;
-        ResOpen = error(_Error),
-        Message = "Error writing temporary file " ++ Filename,
-        Res = error(Message)
+        Res0 = error(Error),
+        Res = error("Error opening temporary file: " ++ Error)
     ).
 
 :- func allow_header_error(prepare_temp) = bool.
