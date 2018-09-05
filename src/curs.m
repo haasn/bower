@@ -47,7 +47,8 @@
 :- pred nodelay(bool::in, io::di, io::uo) is det.
 
     % halfdelay(Tenths, !IO)
-    % Enable halfdelay mode. The delay is in tenths of a second.
+    % Enable halfdelay mode. The delay is in tenths of a second
+    % between 1 and 255.
     %
 :- pred halfdelay(int::in, io::di, io::uo) is det.
 
@@ -56,13 +57,37 @@
     %
 :- pred stop(io::di, io::uo) is det.
 
-:- pred def_prog_mode(io::di, io::uo) is det.
-
-:- pred reset_prog_mode(io::di, io::uo) is det.
-
     % A wrapper predicate that handles calling start and stop.
     %
 :- pred session(pred(io, io)::(pred(di, uo) is det), io::di, io::uo) is det.
+
+    % Save the current terminal mode as the "program" (in curses) state.
+    %
+:- pred def_prog_mode(io::di, io::uo) is det.
+
+    % Save the current terminal mode as the "shell" (in curses) state.
+    %
+:- pred def_shell_mode(io::di, io::uo) is det.
+
+    % Restore the terminal to "program" (in curses) state.
+    %
+:- pred reset_prog_mode(io::di, io::uo) is det.
+
+    % Restore the terminal to "shell" (not in curses) state.
+    %
+:- pred reset_shell_mode(io::di, io::uo) is det.
+
+    % A wrapper predicate that saves the "program" state,
+    % temporarily leaves curses, runs the given predicate,
+    % restores the saved "program" state, then refreshes the display.
+    %
+:- pred suspend(pred(T, io, io), T, io, io).
+:- mode suspend(in(pred(out, di, uo) is det), out, di, uo) is det.
+
+    % As above, without stopping curses (endwin).
+    %
+:- pred soft_suspend(pred(T, io, io), T, io, io).
+:- mode soft_suspend(in(pred(out, di, uo) is det), out, di, uo) is det.
 
     % Number of rows and columns on the physical screen.
     %
@@ -337,6 +362,8 @@
 
 :- implementation.
 
+:- import_module exception.
+
     % Using the foreign type prevents problems with type ambiguity when
     % compiling with intermodule optimisation.
     %
@@ -517,6 +544,13 @@ init_pair(FG_BG(COLOR_WHITE, COLOR_WHITE),      COLOR_WHITE, COLOR_WHITE);
     IO = IO0;
 ").
 
+%-----------------------------------------------------------------------------%
+
+session(P, !IO) :-
+    start(!IO),
+    P(!IO),
+    stop(!IO).
+
 %----------------------------------------------------------------------------%
 
 :- pragma foreign_proc("C",
@@ -524,6 +558,16 @@ init_pair(FG_BG(COLOR_WHITE, COLOR_WHITE),      COLOR_WHITE, COLOR_WHITE);
     [will_not_call_mercury, promise_pure],
 "
     def_prog_mode();
+    IO = IO0;
+").
+
+%----------------------------------------------------------------------------%
+
+:- pragma foreign_proc("C",
+    def_shell_mode(IO0::di, IO::uo),
+    [will_not_call_mercury, promise_pure],
+"
+    def_shell_mode();
     IO = IO0;
 ").
 
@@ -539,10 +583,55 @@ init_pair(FG_BG(COLOR_WHITE, COLOR_WHITE),      COLOR_WHITE, COLOR_WHITE);
 
 %-----------------------------------------------------------------------------%
 
-session(P, !IO) :-
-    start(!IO),
-    P(!IO),
-    stop(!IO).
+:- pragma foreign_proc("C",
+    reset_shell_mode(IO0::di, IO::uo),
+    [will_not_call_mercury, promise_pure],
+"
+    reset_shell_mode();
+    IO = IO0;
+").
+
+%-----------------------------------------------------------------------------%
+
+suspend(Pred, Res, !IO) :-
+    % ncurses programming HOWTO - Temporarily Leaving Curses mode.
+    def_prog_mode(!IO),
+    stop(!IO),
+    promise_equivalent_solutions [Res, !:IO]
+    ( try [io(!IO)]
+        Pred(Res, !IO)
+    then
+        reset_prog_mode(!IO),
+        refresh(!IO)
+    catch_any Excp ->
+        reset_prog_mode(!IO),
+        refresh(!IO),
+        throw(Excp)
+    ).
+
+%-----------------------------------------------------------------------------%
+
+soft_suspend(Pred, Res, !IO) :-
+    % Don't know how to do this properly; this is the best I could achieve
+    % through trial and error.
+    %
+    % We need to prepare for Pred to be able to draw to the screen itself.
+    % But if Pred produces no output in most cases, we don't want to see a
+    % brief flash as the terminal goes to non-alternate then back to alternate
+    % mode, which we would get if we used endwin() to leave curses.
+    def_prog_mode(!IO),
+    reset_shell_mode(!IO),      % not endwin
+    promise_equivalent_solutions [Res, !:IO]
+    ( try [io(!IO)]
+        Pred(Res, !IO)
+    then
+        reset_prog_mode(!IO),
+        redrawwin_stdscr(!IO)   % not refresh
+    catch_any Excp ->
+        reset_prog_mode(!IO),
+        redrawwin_stdscr(!IO),
+        throw(Excp)
+    ).
 
 %----------------------------------------------------------------------------%
 

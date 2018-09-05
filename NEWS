@@ -1,3 +1,28 @@
+Bower 0.9-unreleased
+====================
+
+* Add ',' key to go to next unread thread/message (synonym for Tab).
+* thread/pager: Show pager progress as percentage of current message.
+* thread/pager: Periodically poll for new messages.
+* config: Replace index.poll_period_secs with ui.poll_period_secs.
+* Support conversion of message parts to text using external filters.
+
+Bower 0.8.1 (2018-04-01)
+========================
+
+* Save/restore curses mode for any command that might invoke pinentry-curses.
+* Add makefile target to produce man page (bower.1).
+
+Bower 0.8 (2017-07-30)
+======================
+This release requires notmuch 0.21 or above.
+
+* Look up addresses using notmuch address.
+* Move add to addressbook to '@' key.
+* Add 'a' keys to apply '-inbox -unread' or else '+inbox'.
+* Add 'A' key to leave thread view and apply '-inbox -unread' to the thread.
+* Bug fixes and minor improvements.
+
 Bower 0.7 (2016-03-28)
 ======================
 This release requires notmuch 0.16 or above (notmuch 0.19+ is recommended)

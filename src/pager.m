@@ -31,7 +31,7 @@
 :- pred setup_pager(prog_config::in, setup_mode::in, int::in,
     list(message)::in, pager_info::out, io::di, io::uo) is det.
 
-:- pred setup_pager_for_staging(prog_config::in, int::in, string::in,
+:- pred setup_pager_for_staging(int::in, string::in,
     retain_pager_pos::in, pager_info::out) is det.
 
 :- type pager_action
@@ -89,18 +89,19 @@
 :- pred get_highlighted_thing(pager_info::in, highlighted_thing::out)
     is semidet.
 
-:- pred replace_node_under_cursor(int::in, int::in, part::in,
+:- pred replace_node_under_cursor(prog_config::in, int::in, int::in, part::in,
     pager_info::in, pager_info::out, io::di, io::uo) is det.
 
 :- type toggle_type
     --->    cycle_alternatives
     ;       toggle_expanded.
 
-:- pred toggle_content(toggle_type::in, int::in, int::in, message_update::out,
-    pager_info::in, pager_info::out, io::di, io::uo) is det.
-
-:- pred draw_pager(pager_attrs::in, screen::in, pager_info::in, io::di, io::uo)
+:- pred toggle_content(prog_config::in, toggle_type::in, int::in, int::in,
+    message_update::out, pager_info::in, pager_info::out, io::di, io::uo)
     is det.
+
+:- pred get_percent_visible(pager_info::in, int::in, message_id::in, int::out)
+    is semidet.
 
 :- pred draw_pager_lines(pager_attrs::in, list(panel)::in, pager_info::in,
     io::di, io::uo) is det.
@@ -116,6 +117,7 @@
 :- import_module counter.
 :- import_module float.
 :- import_module int.
+:- import_module map.
 :- import_module set.
 :- import_module string.
 :- import_module time.
@@ -124,6 +126,7 @@
 :- import_module copious_output.
 :- import_module fold_lines.
 :- import_module list_util.
+:- import_module mime_type.
 :- import_module pager_text.
 :- import_module quote_arg.
 :- import_module string_util.
@@ -133,10 +136,10 @@
 
 :- type pager_info
     --->    pager_info(
-                p_config        :: prog_config,
                 p_tree          :: tree,
                 p_id_counter    :: counter,
-                p_scrollable    :: scrollable(id_pager_line)
+                p_scrollable    :: scrollable(id_pager_line),
+                p_extents       :: map(message_id, message_extents)
             ).
 
 :- type node_id
@@ -165,7 +168,7 @@
                 part            :: part,
                 % Hidden alternatives for multipart/alternative.
                 alternatives    :: list(part),
-                part_expanded   :: part_expanded,
+                ph_expanded     :: part_expanded,
                 importance      :: part_importance
             )
     ;       fold_marker(
@@ -178,12 +181,22 @@
     ;       message_separator.
 
 :- type part_expanded
-    --->    part_expanded
+    --->    part_expanded(part_filtered)
     ;       part_not_expanded.
+
+:- type part_filtered
+    --->    part_filtered
+    ;       part_not_filtered.
 
 :- type part_importance
     --->    importance_normal
     ;       importance_low.
+
+:- type message_extents
+    --->    message_extents(
+                start_line      :: int,
+                end_excl_line   :: int
+            ).
 
 :- type binding
     --->    leave_pager
@@ -252,8 +265,20 @@ make_id_pager_line(NodeId, Line) = NodeId - Line.
 
 :- pred is_blank_line(pager_line::in) is semidet.
 
-is_blank_line(text(pager_text(_, "", _, _))).
-is_blank_line(message_separator).
+is_blank_line(Line) :-
+    require_complete_switch [Line]
+    (
+        Line = text(pager_text(_, "", _, _))
+    ;
+        Line = message_separator
+    ;
+        ( Line = header(_, _, _, _)
+        ; Line = part_head(_, _, _, _)
+        ; Line = fold_marker(_, _)
+        ; Line = signature(_)
+        ),
+        fail
+    ).
 
 :- pred replace_node(node_id::in, tree::in, tree::in, tree::out) is det.
 
@@ -279,8 +304,10 @@ setup_pager(Config, Mode, Cols, Messages, Info, !IO) :-
     list.map_foldl2(make_message_tree(Config, Mode, Cols), Messages, Trees,
         Counter1, Counter, !IO),
     Tree = node(NodeId, Trees, no),
-    Scrollable = scrollable.init(flatten(Tree)),
-    Info = pager_info(Config, Tree, Counter, Scrollable).
+    Flattened = flatten(Tree),
+    Scrollable = scrollable.init(Flattened),
+    make_extents(Flattened, Extents),
+    Info = pager_info(Tree, Counter, Scrollable, Extents).
 
 :- pred make_message_tree(prog_config::in, setup_mode::in, int::in,
     message::in, tree::out, counter::in, counter::out, io::di, io::uo) is det.
@@ -383,26 +410,41 @@ make_part_tree(Config, Cols, Part, Tree, !ElideInitialHeadLine, !Counter, !IO)
         !ElideInitialHeadLine, !Counter, !IO).
 
 :- pred make_part_tree_with_alts(prog_config::in, int::in, list(part)::in,
-    part::in, expand_unsupported::in, tree::out, bool::in, bool::out,
+    part::in, handle_unsupported::in, tree::out, bool::in, bool::out,
     counter::in, counter::out, io::di, io::uo) is det.
 
-make_part_tree_with_alts(Config, Cols, AltParts, Part, ExpandUnsupported, Tree,
+make_part_tree_with_alts(Config, Cols, AltParts, Part, HandleUnsupported, Tree,
         !ElideInitialHeadLine, !Counter, !IO) :-
-    Part = part(_MessageId, _PartId, Type, Content, _MaybeFilename,
+    Part = part(_MessageId, _PartId, PartType, Content, _MaybeFilename,
         _MaybeEncoding, _MaybeLength, _IsDecrypted),
     allocate_node_id(PartNodeId, !Counter),
     (
-        Content = text(Text),
+        Content = text(InlineText),
+        ( get_text_filter_command(Config, PartType, FilterCommand) ->
+            filter_text_part(FilterCommand, InlineText, FilterRes, !IO),
+            (
+                FilterRes = ok(Text)
+            ;
+                FilterRes = error(Error),
+                Text = "(filter error: " ++ Error ++ ")\n" ++ InlineText
+            ),
+            Filtered = part_filtered
+        ;
+            Text = InlineText,
+            Filtered = part_not_filtered
+        ),
         make_text_lines(Cols, Text, Lines0),
         list.map(wrap_text, Lines0) = Lines,
         fold_quote_blocks(Lines, TextTrees, !Counter),
         (
             !.ElideInitialHeadLine = yes,
-            AltParts = []
+            PartType = mime_type.text_plain,
+            AltParts = [],
+            Filtered = part_not_filtered
         ->
             SubTrees = TextTrees
         ;
-            HeadLine = part_head(Part, AltParts, part_expanded,
+            HeadLine = part_head(Part, AltParts, part_expanded(Filtered),
                 importance_normal),
             SubTrees = [leaf([HeadLine]) | TextTrees]
         ),
@@ -411,14 +453,15 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, ExpandUnsupported, Tree,
     ;
         Content = subparts(Encryption, Signatures, SubParts),
         (
-            strcase_equal(Type, "multipart/alternative"),
+            PartType = mime_type.multipart_alternative,
             select_alternative(SubParts, [FirstSubPart | RestSubParts])
         ->
             % Assuming Signatures = []
             make_part_tree_with_alts(Config, Cols, RestSubParts, FirstSubPart,
                 default, Tree, no, _ElideInitialHeadLine, !Counter, !IO)
         ;
-            get_importance(Type, AltParts, Encryption, Signatures, Importance),
+            get_importance(PartType, AltParts, Encryption, Signatures,
+                Importance),
             map(make_signature_line, Signatures, SignatureLines),
             (
                 (
@@ -429,7 +472,7 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, ExpandUnsupported, Tree,
                 (
                     AltParts = [],
                     SignatureLines = [],
-                    hide_multipart_head_line(Type)
+                    hide_multipart_head_line(PartType)
                 ->
                     list.map_foldl3(make_part_tree(Config, Cols), SubParts,
                         SubPartsTrees, !ElideInitialHeadLine, !Counter, !IO),
@@ -437,8 +480,8 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, ExpandUnsupported, Tree,
                 ;
                     list.map_foldl3(make_part_tree(Config, Cols), SubParts,
                         SubPartsTrees, yes, _ElideInitialHeadLine, !Counter, !IO),
-                    HeadLine = part_head(Part, AltParts, part_expanded,
-                        Importance),
+                    HeadLine = part_head(Part, AltParts,
+                        part_expanded(part_not_filtered), Importance),
                     SubTrees = [leaf([HeadLine | SignatureLines])
                         | SubPartsTrees],
                     Tree = node(PartNodeId, SubTrees, yes),
@@ -461,7 +504,8 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, ExpandUnsupported, Tree,
         Content = encapsulated_messages(EncapMessages),
         list.map_foldl2(make_encapsulated_message_tree(Config, Cols),
             EncapMessages, SubTrees0, !Counter, !IO),
-        HeadLine = part_head(Part, AltParts, part_expanded, importance_normal),
+        HeadLine = part_head(Part, AltParts,
+            part_expanded(part_not_filtered), importance_normal),
         SubTrees = [leaf([HeadLine]) | SubTrees0],
         Tree = node(PartNodeId, SubTrees, yes),
         !:ElideInitialHeadLine = no
@@ -469,12 +513,12 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, ExpandUnsupported, Tree,
         Content = unsupported,
         (
             AltParts = [],
-            hide_unsupported_part(Type)
+            hide_unsupported_part(PartType)
         ->
             Tree = leaf([])
         ;
             make_unsupported_part_tree(Config, Cols, PartNodeId, Part,
-                ExpandUnsupported, AltParts, Tree, !IO)
+                HandleUnsupported, AltParts, Tree, !IO)
         ),
         !:ElideInitialHeadLine = no
     ).
@@ -493,10 +537,10 @@ select_alternative([X | Xs], Parts) :-
         Parts = [X | Xs]
     ).
 
-:- pred get_importance(string::in, list(part)::in, encryption::in,
+:- pred get_importance(mime_type::in, list(part)::in, encryption::in,
     list(signature)::in, part_importance::out) is det.
 
-get_importance(Type, AltParts, Encryption, Signatures, Importance) :-
+get_importance(PartType, AltParts, Encryption, Signatures, Importance) :-
     (
         AltParts = [_ | _],
         Importance = importance_normal
@@ -513,7 +557,7 @@ get_importance(Type, AltParts, Encryption, Signatures, Importance) :-
         ;
             Encryption = not_encrypted,
             (
-                strcase_equal(Type, "multipart/signed"),
+                PartType = mime_type.multipart_signed,
                 Signatures = [_ | _]
             ->
                 Importance = importance_low     % already verified
@@ -527,22 +571,22 @@ get_importance(Type, AltParts, Encryption, Signatures, Importance) :-
 
 make_signature_line(Signature, signature(Signature)).
 
-:- pred hide_multipart_head_line(string::in) is semidet.
+:- pred hide_multipart_head_line(mime_type::in) is semidet.
 
 hide_multipart_head_line(PartType) :-
     (
-        strcase_equal(PartType, "multipart/mixed")
+        PartType = mime_type.multipart_mixed
     ;
-        strcase_equal(PartType, "multipart/related")
+        PartType = mime_type.multipart_related
     ).
 
-:- pred hide_unsupported_part(string::in) is semidet.
+:- pred hide_unsupported_part(mime_type::in) is semidet.
 
 hide_unsupported_part(PartType) :-
     (
-        strcase_equal(PartType, "application/pgp-encrypted")
+        PartType = mime_type.application_pgp_encrypted
     ;
-        strcase_equal(PartType, "application/pgp-signature")
+        PartType = mime_type.application_pgp_signature
     ).
 
 %-----------------------------------------------------------------------------%
@@ -654,30 +698,39 @@ add_encapsulated_header(Header, Value, RevLines0, RevLines) :-
 
 %-----------------------------------------------------------------------------%
 
-:- type expand_unsupported
+:- type handle_unsupported
     --->    default
-    ;       force(part_expanded).
+    ;       expand_unsupported
+    ;       hide_unsupported.
 
 :- pred make_unsupported_part_tree(prog_config::in, int::in, node_id::in,
-    part::in, expand_unsupported::in, list(part)::in, tree::out,
+    part::in, handle_unsupported::in, list(part)::in, tree::out,
     io::di, io::uo) is det.
 
-make_unsupported_part_tree(Config, Cols, PartNodeId, Part, ExpandUnsupported,
+make_unsupported_part_tree(Config, Cols, PartNodeId, Part, HandleUnsupported,
         AltParts, Tree, !IO) :-
-    Part = part(MessageId, MaybePartId, Type, _Content, _MaybeFilename,
+    Part = part(MessageId, MaybePartId, PartType, _Content, _MaybeFilename,
         _MaybeEncoding, _MaybeLength, _IsDecrypted),
-    % XXX we should use mailcap, though we don't want to show everything
-    IsHtml = ( strcase_equal(Type, "text/html") -> yes ; no ),
     (
-        ExpandUnsupported = default,
-        Expanded = expand_unsupported_default(IsHtml)
+        HandleUnsupported = default,
+        DoExpand = ( if PartType = mime_type.text_html then yes else no )
     ;
-        ExpandUnsupported = force(Expanded)
+        HandleUnsupported = expand_unsupported,
+        DoExpand = yes
+    ;
+        HandleUnsupported = hide_unsupported,
+        DoExpand = no
     ),
     (
-        Expanded = part_expanded,
+        DoExpand = bool.yes,
         MaybePartId = yes(PartId),
-        MaybeFilterCommand = maybe_filter_command(Config, IsHtml),
+        ( get_text_filter_command(Config, PartType, FilterCommand) ->
+            MaybeFilterCommand = yes(FilterCommand),
+            Filtered = part_filtered
+        ;
+            MaybeFilterCommand = no,
+            Filtered = part_not_filtered
+        ),
         expand_part(Config, MessageId, PartId, MaybeFilterCommand,
             MaybeText, !IO),
         (
@@ -686,40 +739,21 @@ make_unsupported_part_tree(Config, Cols, PartNodeId, Part, ExpandUnsupported,
         ;
             MaybeText = error(Error),
             make_text_lines(Cols, "(" ++ Error ++ ")", TextLines)
-        )
+        ),
+        Expanded = part_expanded(Filtered)
     ;
-        Expanded = part_expanded,
+        DoExpand = bool.yes,
         MaybePartId = no,
-        make_text_lines(Cols, "(no part id)", TextLines)
+        make_text_lines(Cols, "(no part id)", TextLines),
+        Expanded = part_expanded(part_not_filtered)
     ;
+        DoExpand = bool.no,
         Expanded = part_not_expanded,
         TextLines = []
     ),
     HeadLine = part_head(Part, AltParts, Expanded, importance_normal),
     Lines = [HeadLine | wrap_texts(TextLines)],
     Tree = node(PartNodeId, [leaf(Lines)], yes).
-
-:- func expand_unsupported_default(bool) = part_expanded.
-
-expand_unsupported_default(IsHtml) = Expanded :-
-    (
-        IsHtml = yes,
-        Expanded = part_expanded
-    ;
-        IsHtml = no,
-        Expanded = part_not_expanded
-    ).
-
-:- func maybe_filter_command(prog_config, bool) = maybe(command_prefix).
-
-maybe_filter_command(Config, IsHtml) = MaybeFilterCommand :-
-    (
-        IsHtml = yes,
-        get_maybe_html_dump_command(Config, MaybeFilterCommand)
-    ;
-        IsHtml = no,
-        MaybeFilterCommand = no
-    ).
 
 %-----------------------------------------------------------------------------%
 
@@ -737,7 +771,7 @@ wrap_text(Text) = text(Text).
 
 %-----------------------------------------------------------------------------%
 
-setup_pager_for_staging(Config, Cols, Text, RetainPagerPos, Info) :-
+setup_pager_for_staging(Cols, Text, RetainPagerPos, Info) :-
     make_text_lines(Cols, Text, Lines0),
     Lines = wrap_texts(Lines0) ++ [
         message_separator,
@@ -747,8 +781,10 @@ setup_pager_for_staging(Config, Cols, Text, RetainPagerPos, Info) :-
     counter.init(0, Counter0),
     allocate_node_id(NodeId, Counter0, Counter),
     Tree = node(NodeId, [leaf(Lines)], no),
-    Scrollable0 = scrollable.init(flatten(Tree)),
-    Info0 = pager_info(Config, Tree, Counter, Scrollable0),
+    Flattened = flatten(Tree),
+    Scrollable0 = scrollable.init(Flattened),
+    make_extents(Flattened, Extents0),
+    Info0 = pager_info(Tree, Counter, Scrollable0, Extents0),
     (
         RetainPagerPos = new_pager,
         Info = Info0
@@ -983,7 +1019,8 @@ goto_end(NumRows, !Info) :-
 
 :- pred is_message_start(id_pager_line::in) is semidet.
 
-is_message_start(_Id - header(yes(_), _, _, _)).
+is_message_start(IdLine) :-
+    is_start_of_message(IdLine, _Message).
 
 skip_quoted_text(MessageUpdate, !Info) :-
     Scrollable0 = !.Info ^ p_scrollable,
@@ -1003,11 +1040,6 @@ skip_quoted_text(MessageUpdate, !Info) :-
 :- pred is_quoted_text_or_message_start(id_pager_line::in) is semidet.
 
 is_quoted_text_or_message_start(_Id - Line) :-
-    is_quoted_text_or_message_start_2(Line).
-
-:- pred is_quoted_text_or_message_start_2(pager_line::in) is semidet.
-
-is_quoted_text_or_message_start_2(Line) :-
     require_complete_switch [Line]
     (
         Line = header(yes(_), _, _, _)
@@ -1037,36 +1069,34 @@ get_top_message(Info, Message) :-
     Top = get_top(Scrollable),
     Lines = get_lines(Scrollable),
     ( Top < version_array.size(Lines) ->
-        get_top_message_2(Lines, Top, _, Message)
+        scan_back_for_message_start(Lines, Top, _, Message)
     ;
         fail
     ).
-
-:- pred get_top_message_2(version_array(id_pager_line)::in, int::in, int::out,
-    message::out) is semidet.
-
-get_top_message_2(Lines, I, J, Message) :-
-    ( I >= 0 ->
-        version_array.lookup(Lines, I) = _Id - Line,
-        ( Line = header(yes(Message0), _, _, _) ->
-            J = I,
-            Message = Message0
-        ;
-            get_top_message_2(Lines, I - 1, J, Message)
-        )
-    ;
-        fail
-    ).
-
-%-----------------------------------------------------------------------------%
 
 get_top_offset(Info, Offset) :-
     Scrollable = Info ^ p_scrollable,
     Top = get_top(Scrollable),
     Lines = get_lines(Scrollable),
     ( Top < version_array.size(Lines) ->
-        get_top_message_2(Lines, Top, MessageLine, _Message),
+        scan_back_for_message_start(Lines, Top, MessageLine, _Message),
         Offset = Top - MessageLine
+    ;
+        fail
+    ).
+
+:- pred scan_back_for_message_start(version_array(id_pager_line)::in,
+    int::in, int::out, message::out) is semidet.
+
+scan_back_for_message_start(Lines, I, J, Message) :-
+    ( I >= 0 ->
+        version_array.lookup(Lines, I) = IdLine,
+        ( is_start_of_message(IdLine, Message0) ->
+            J = I,
+            Message = Message0
+        ;
+            scan_back_for_message_start(Lines, I - 1, J, Message)
+        )
     ;
         fail
     ).
@@ -1075,19 +1105,13 @@ get_top_offset(Info, Offset) :-
 
 skip_to_message(MessageId, !Info) :-
     Scrollable0 = !.Info ^ p_scrollable,
-    ( search_forward(is_message_start(MessageId), Scrollable0, 0, Top, _) ->
-        set_top(Top, Scrollable0, Scrollable),
+    Extents0 = !.Info ^ p_extents,
+    ( map.search(Extents0, MessageId, message_extents(Start, _EndExcl)) ->
+        set_top(Start, Scrollable0, Scrollable),
         !Info ^ p_scrollable := Scrollable
     ;
         true
     ).
-
-:- pred is_message_start(message_id::in, id_pager_line::in)
-    is semidet.
-
-is_message_start(MessageId, _Id - Line) :-
-    Line = header(yes(Message), _, _, _),
-    Message ^ m_id = MessageId.
 
 %-----------------------------------------------------------------------------%
 
@@ -1175,8 +1199,8 @@ line_matches_search(Search, Line) :-
     ;
         Line = part_head(Part, _, _, _),
         (
-            Part ^ pt_type = Type,
-            strcase_str(Type, Search)
+            Part ^ pt_type = PartType,
+            strcase_str(to_string(PartType), Search)
         ;
             Part ^ pt_filename = yes(FileName),
             strcase_str(FileName, Search)
@@ -1236,19 +1260,36 @@ do_highlight(Highlightable, NumRows, !Info) :-
 :- pred is_highlightable_minor(id_pager_line::in) is semidet.
 
 is_highlightable_minor(_Id - Line) :-
+    require_complete_switch [Line]
     (
         Line = part_head(_, _, _, importance_normal)
     ;
         Line = text(pager_text(_, _, _, url(_, _)))
     ;
         Line = fold_marker(_, _)
+    ;
+        ( Line = header(_, _, _, _)
+        ; Line = signature(_)
+        ; Line = message_separator
+        ),
+        fail
     ).
 
 :- pred is_highlightable_major(id_pager_line::in) is semidet.
 
 is_highlightable_major(_Id - Line) :-
-    ( Line = header(yes(_), _, _, _)
-    ; Line = part_head(_, _, _, _)
+    require_complete_switch [Line]
+    (
+        Line = header(yes(_), _, _, _)
+    ;
+        Line = part_head(_, _, _, _)
+    ;
+        ( Line = text(_)
+        ; Line = fold_marker(_, _)
+        ; Line = signature(_)
+        ; Line = message_separator
+        ),
+        fail
     ).
 
 get_highlighted_thing(Info, Thing) :-
@@ -1260,8 +1301,8 @@ get_highlighted_thing(Info, Thing) :-
         MessageId = Message ^ m_id,
         Subject = Message ^ m_headers ^ h_subject,
         PartId = 0,
-        Part = part(MessageId, yes(PartId), "text/plain", unsupported, no, no,
-            no, no),
+        Part = part(MessageId, yes(PartId), mime_type.text_plain, unsupported,
+            no, no, no, no),
         MaybeSubject = yes(Subject),
         Thing = highlighted_part(Part, MaybeSubject)
     ;
@@ -1288,39 +1329,41 @@ get_highlighted_thing(Info, Thing) :-
 
 %-----------------------------------------------------------------------------%
 
-replace_node_under_cursor(NumRows, Cols, Part, Info0, Info, !IO) :-
-    Info0 = pager_info(Config, Tree0, Counter0, Scrollable0),
+replace_node_under_cursor(Config, NumRows, Cols, Part, Info0, Info, !IO) :-
+    Info0 = pager_info(Tree0, Counter0, Scrollable0, _Extents0),
     ( get_cursor_line(Scrollable0, _, NodeId - _Line) ->
         make_part_tree(Config, Cols, Part, NewNode, no, _ElideInitialHeadLine,
             Counter0, Counter, !IO),
         replace_node(NodeId, NewNode, Tree0, Tree),
-        scrollable.reinit(flatten(Tree), NumRows, Scrollable0, Scrollable),
-        Info = pager_info(Config, Tree, Counter, Scrollable)
+        Flattened = flatten(Tree),
+        scrollable.reinit(Flattened, NumRows, Scrollable0, Scrollable),
+        make_extents(Flattened, Extents),
+        Info = pager_info(Tree, Counter, Scrollable, Extents)
     ;
         Info = Info0
     ).
 
 %-----------------------------------------------------------------------------%
 
-toggle_content(ToggleType, NumRows, Cols, MessageUpdate, !Info, !IO) :-
+toggle_content(Config, ToggleType, NumRows, Cols, MessageUpdate, !Info, !IO) :-
     Scrollable0 = !.Info ^ p_scrollable,
     ( get_cursor_line(Scrollable0, _Cursor, IdLine) ->
-        toggle_line(ToggleType, NumRows, Cols, IdLine, MessageUpdate,
+        toggle_line(Config, ToggleType, NumRows, Cols, IdLine, MessageUpdate,
             !Info, !IO)
     ;
         MessageUpdate = clear_message
     ).
 
-:- pred toggle_line(toggle_type::in, int::in, int::in, id_pager_line::in,
-    message_update::out, pager_info::in, pager_info::out, io::di, io::uo)
-    is det.
+:- pred toggle_line(prog_config::in, toggle_type::in, int::in, int::in,
+    id_pager_line::in, message_update::out, pager_info::in, pager_info::out,
+    io::di, io::uo) is det.
 
-toggle_line(ToggleType, NumRows, Cols, NodeId - Line, MessageUpdate,
+toggle_line(Config, ToggleType, NumRows, Cols, NodeId - Line, MessageUpdate,
         !Info, !IO) :-
     (
         Line = part_head(_, _, _, _),
-        toggle_part(ToggleType, NumRows, Cols, NodeId, Line, MessageUpdate,
-            !Info, !IO)
+        toggle_part(Config, ToggleType, NumRows, Cols, NodeId, Line,
+            MessageUpdate, !Info, !IO)
     ;
         Line = fold_marker(_, _),
         toggle_folding(NumRows, NodeId, Line, !Info),
@@ -1337,67 +1380,63 @@ toggle_line(ToggleType, NumRows, Cols, NodeId - Line, MessageUpdate,
 :- inst part_head
     --->    part_head(ground, ground, ground, ground).
 
-:- pred toggle_part(toggle_type::in, int::in, int::in, node_id::in,
-    pager_line::in(part_head), message_update::out,
+:- pred toggle_part(prog_config::in, toggle_type::in, int::in, int::in,
+    node_id::in, pager_line::in(part_head), message_update::out,
     pager_info::in, pager_info::out, io::di, io::uo) is det.
 
-toggle_part(ToggleType, NumRows, Cols, NodeId, Line, MessageUpdate,
+toggle_part(Config, ToggleType, NumRows, Cols, NodeId, Line, MessageUpdate,
         Info0, Info, !IO) :-
     Line = part_head(Part0, HiddenParts0, Expanded0, _Importance0),
     (
         ToggleType = cycle_alternatives,
-        Expanded0 = part_expanded,
+        Expanded0 = part_expanded(_),
         HiddenParts0 = [Part | HiddenParts1]
     ->
         HiddenParts = HiddenParts1 ++ [Part0],
-        Info0 = pager_info(Config, Tree0, Counter0, Scrollable0),
+        Info0 = pager_info(Tree0, Counter0, Scrollable0, _Extents0),
         make_part_tree_with_alts(Config, Cols, HiddenParts, Part,
-            force(Expanded0), NewNode, no, _ElideInitialHeadLine,
+            expand_unsupported, NewNode, no, _ElideInitialHeadLine,
             Counter0, Counter, !IO),
         replace_node(NodeId, NewNode, Tree0, Tree),
-        scrollable.reinit(flatten(Tree), NumRows, Scrollable0, Scrollable),
-        Info = pager_info(Config, Tree, Counter, Scrollable),
-        Type = Part ^ pt_type,
+        Flattened = flatten(Tree),
+        scrollable.reinit(Flattened, NumRows, Scrollable0, Scrollable),
+        make_extents(Flattened, Extents),
+        Info = pager_info(Tree, Counter, Scrollable, Extents),
+        Type = mime_type.to_string(Part ^ pt_type),
         MessageUpdate = set_info("Showing " ++ Type ++ " alternative.")
     ;
         % Fallback.
-        toggle_part_expanded(NumRows, Cols, NodeId, Line, MessageUpdate,
-            Info0, Info, !IO)
+        toggle_part_expanded(Config, NumRows, Cols, NodeId, Line,
+            MessageUpdate, Info0, Info, !IO)
     ).
 
-:- pred toggle_part_expanded(int::in, int::in, node_id::in,
+:- pred toggle_part_expanded(prog_config::in, int::in, int::in, node_id::in,
     pager_line::in(part_head), message_update::out,
     pager_info::in, pager_info::out, io::di, io::uo) is det.
 
-toggle_part_expanded(NumRows, Cols, NodeId, Line0, MessageUpdate, Info0, Info,
-        !IO) :-
-    Line0 = part_head(Part, HiddenParts, Expanded0, Importance),
+toggle_part_expanded(Config, NumRows, Cols, NodeId, Line0, MessageUpdate,
+        Info0, Info, !IO) :-
+    Line0 = part_head(Part, HiddenParts, WasExpanded, Importance),
+    Info0 = pager_info(Tree0, Counter0, Scrollable0, _Extents0),
     (
-        Expanded0 = part_expanded,
-        Expanded = part_not_expanded,
-        MessageUpdate = set_info("Part hidden.")
-    ;
-        Expanded0 = part_not_expanded,
-        Expanded = part_expanded,
-        MessageUpdate = set_info("Showing part.")
-    ),
-
-    Info0 = pager_info(Config, Tree0, Counter0, Scrollable0),
-    (
-        Expanded = part_expanded,
+        WasExpanded = part_not_expanded,
+        MessageUpdate = set_info("Showing part."),
         make_part_tree_with_alts(Config, Cols, HiddenParts, Part,
-            force(Expanded), NewNode, no, _ElideInitialHeadLine,
+            expand_unsupported, NewNode, no, _ElideInitialHeadLine,
             Counter0, Counter, !IO),
         replace_node(NodeId, NewNode, Tree0, Tree)
     ;
-        Expanded = part_not_expanded,
+        WasExpanded = part_expanded(_),
+        MessageUpdate = set_info("Part hidden."),
         Line = part_head(Part, HiddenParts, part_not_expanded, Importance),
         NewNode = node(NodeId, [leaf([Line])], yes),
         replace_node(NodeId, NewNode, Tree0, Tree),
         Counter = Counter0
     ),
-    scrollable.reinit(flatten(Tree), NumRows, Scrollable0, Scrollable),
-    Info = pager_info(Config, Tree, Counter, Scrollable).
+    Flattened = flatten(Tree),
+    scrollable.reinit(Flattened, NumRows, Scrollable0, Scrollable),
+    make_extents(Flattened, Extents),
+    Info = pager_info(Tree, Counter, Scrollable, Extents).
 
 :- inst fold_marker
     --->    fold_marker(ground, ground).
@@ -1418,16 +1457,118 @@ toggle_folding(NumRows, NodeId, Line, Info0, Info) :-
     ),
     NewNode = node(NodeId, [SubTree], no),
 
-    Info0 = pager_info(Config, Tree0, Counter, Scrollable0),
+    Info0 = pager_info(Tree0, Counter, Scrollable0, _Extents0),
     replace_node(NodeId, NewNode, Tree0, Tree),
-    scrollable.reinit(flatten(Tree), NumRows, Scrollable0, Scrollable),
-    Info = pager_info(Config, Tree, Counter, Scrollable).
+    Flattened = flatten(Tree),
+    scrollable.reinit(Flattened, NumRows, Scrollable0, Scrollable),
+    make_extents(Flattened, Extents),
+    Info = pager_info(Tree, Counter, Scrollable, Extents).
 
 %-----------------------------------------------------------------------------%
 
-draw_pager(Attrs, Screen, Info, !IO) :-
-    get_main_panels(Screen, MainPanels),
-    draw_pager_lines(Attrs, MainPanels, Info, !IO).
+:- pred make_extents(list(id_pager_line)::in,
+    map(message_id, message_extents)::out) is det.
+
+make_extents(Lines, Extents) :-
+    make_extents_loop(Lines, 0, map.init, Extents).
+
+:- pred make_extents_loop(list(id_pager_line)::in, int::in,
+    map(message_id, message_extents)::in,
+    map(message_id, message_extents)::out) is det.
+
+make_extents_loop(Lines, LineNr0, !Extents) :-
+    (
+        Lines = []
+    ;
+        Lines = [HeadLine | TailLines],
+        (
+            is_start_of_message(HeadLine, Message),
+            MessageId = Message ^ m_id
+        ->
+            Start = LineNr0,
+            skip_message_lines(TailLines, NextLines, Start + 1, EndExcl),
+            map.set(MessageId, message_extents(Start, EndExcl), !Extents),
+            make_extents_loop(NextLines, EndExcl, !Extents)
+        ;
+            make_extents_loop(TailLines, LineNr0 + 1, !Extents)
+        )
+    ).
+
+:- pred skip_message_lines(list(id_pager_line)::in, list(id_pager_line)::out,
+    int::in, int::out) is det.
+
+skip_message_lines(Lines0, Lines, LineNr0, LineNr) :-
+    (
+        Lines0 = [],
+        Lines = [],
+        LineNr = LineNr0
+    ;
+        Lines0 = [HeadLine | TailLines],
+        ( is_part_of_message(HeadLine) ->
+            skip_message_lines(TailLines, Lines, LineNr0 + 1, LineNr)
+        ;
+            Lines = Lines0,
+            LineNr = LineNr0
+        )
+    ).
+
+:- pred is_start_of_message(id_pager_line::in, message::out) is semidet.
+
+is_start_of_message(_NodeId - Line, Message) :-
+    require_complete_switch [Line]
+    (
+        Line = header(MaybeStartMessage, _Continue, _Name, _Value),
+        MaybeStartMessage = yes(Message)
+    ;
+        ( Line = text(_)
+        ; Line = part_head(_, _, _, _)
+        ; Line = fold_marker(_, _)
+        ; Line = signature(_)
+        ; Line = message_separator
+        ),
+        fail
+    ).
+
+:- pred is_part_of_message(id_pager_line::in) is semidet.
+
+is_part_of_message(_NodeId - Line) :-
+    require_complete_switch [Line]
+    (
+        Line = header(MaybeStartMessage, _Continue, _Name, _Value),
+        MaybeStartMessage = no
+    ;
+        Line = text(_)
+    ;
+        Line = part_head(_, _, _, _)
+    ;
+        Line = fold_marker(_, _)
+    ;
+        Line = signature(_)
+    ;
+        Line = message_separator,
+        fail
+    ).
+
+%-----------------------------------------------------------------------------%
+
+get_percent_visible(Info, NumPagerRows, MessageId, Percent) :-
+    require_det
+    (
+        Scrollable = Info ^ p_scrollable,
+        Top = get_top(Scrollable),
+        Ref = Top + NumPagerRows,
+        Extents = Info ^ p_extents
+    ),
+    map.search(Extents, MessageId, message_extents(Start, EndExcl)),
+    require_det
+    (
+        F = float(Ref - Start) / float(EndExcl - Start),
+        % floor instead of round, otherwise we see 100% before end of message.
+        I = floor_to_int(100.0 * F),
+        Percent = max(0, min(I, 100))
+    ).
+
+%-----------------------------------------------------------------------------%
 
 draw_pager_lines(Attrs, Panels, Info, !IO) :-
     Scrollable = Info ^ p_scrollable,
@@ -1519,7 +1660,7 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
             Attr = Attr0
         ),
         draw(Panel, Attr, "[-- ", !IO),
-        draw(Panel, ContentType, !IO),
+        draw(Panel, mime_type.to_string(ContentType), !IO),
         (
             MaybeFilename = yes(Filename),
             draw(Panel, "; ", !IO),
@@ -1535,9 +1676,9 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
             MaybeLength = no
         ),
         draw(Panel, " --]", !IO),
-        ( part_message(Part, HiddenParts, Expanded, Message) ->
-            MsgAttr = Attrs ^ p_part_message,
-            draw(Panel, MsgAttr, Message, !IO)
+        ( make_part_message(Part, HiddenParts, Expanded, Message) ->
+            attr(Panel, Attrs ^ p_part_message, !IO),
+            draw2(Panel, "  ", Message, !IO)
         ;
             true
         )
@@ -1666,10 +1807,28 @@ format_length(Size) = String :-
         String = format(" (%.1f MB)", [f(Ms)])
     ).
 
-:- pred part_message(part::in, list(part)::in, part_expanded::in, string::out)
-    is semidet.
+:- pred make_part_message(part::in, list(part)::in, part_expanded::in,
+    string::out) is semidet.
 
-part_message(Part, HiddenParts, Expanded, Message) :-
+make_part_message(Part, HiddenParts, Expanded, Message) :-
+    ( if make_part_message_2(Part, HiddenParts, Expanded, MessageB) then
+        ( if Expanded = part_expanded(part_filtered) then
+            Message = "filtered, " ++ MessageB
+        else
+            Message = MessageB
+        )
+    else
+        ( if Expanded = part_expanded(part_filtered) then
+            Message = "filtered"
+        else
+            fail
+        )
+    ).
+
+:- pred make_part_message_2(part::in, list(part)::in, part_expanded::in,
+    string::out) is semidet.
+
+make_part_message_2(Part, HiddenParts, Expanded, Message) :-
     Content = Part ^ pt_content,
     require_complete_switch [Content]
     (
@@ -1687,29 +1846,29 @@ part_message(Part, HiddenParts, Expanded, Message) :-
         ( EncStatus = encrypted
         ; EncStatus = decryption_bad
         ),
-        Message = "  z to decrypt"
+        Message = "z to decrypt"
     ;
         EncStatus = decryption_good,
-        Message = "  decrypted"
+        Message = "decrypted"
     ;
         EncStatus = not_encrypted,
         (
-            Expanded = part_expanded,
-            HiddenParts = [_],
-            Message = "  z for alternative"
-        ;
-            Expanded = part_expanded,
-            HiddenParts = [_, _ | _],
-            Message = "  z for alternatives"
+            Expanded = part_expanded(_Filtered),
+            (
+                HiddenParts = [],
+                Signatures = [],
+                Part ^ pt_type = mime_type.multipart_signed,
+                Message = "y to verify"
+            ;
+                HiddenParts = [_],
+                Message = "z for alternative"
+            ;
+                HiddenParts = [_, _ | _],
+                Message = "z for alternatives"
+            )
         ;
             Expanded = part_not_expanded,
-            HiddenParts = [_ | _],
-            Message = "  z to show"
-        ;
-            HiddenParts = [],
-            Signatures = [],
-            is_multipart_signed(Part),
-            Message = "  y to verify"
+            Message = "z to show"
         )
     ).
 

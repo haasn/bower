@@ -74,6 +74,7 @@
 :- import_module color.
 :- import_module curs.
 :- import_module curs.panel.
+:- import_module detect_mime_type.
 :- import_module gpgme.
 :- import_module gpgme.key.
 :- import_module maildir.
@@ -83,7 +84,6 @@
 :- import_module pager.
 :- import_module path_expand.
 :- import_module quote_arg.
-:- import_module rfc2045.
 :- import_module rfc2047.
 :- import_module rfc2047.decoder.
 :- import_module rfc5322.writer.
@@ -132,7 +132,7 @@
 :- type attachment
     --->    old_attachment(part)
     ;       new_attachment(
-                att_type        :: string,
+                att_type        :: mime_type,
                 att_content     :: attachment_content,
                 att_filename    :: string,
                 att_size        :: int
@@ -287,7 +287,9 @@ start_reply(Config, Crypto, Screen, Message, ReplyKind, Transition, !IO) :-
         "reply", reply_to_arg(ReplyKind), decrypt_arg(WasEncrypted),
         "--", message_id_to_search_term(MessageId)
     ], redirect_input("/dev/null"), no_redirect, Command),
-    call_system_capture_stdout(Command, no, CommandResult, !IO),
+    % Decryption may invoke pinentry-curses.
+    curs.soft_suspend(
+        call_system_capture_stdout(Command, no), CommandResult, !IO),
     (
         CommandResult = ok(String),
         parse_message(String, Headers0, Text),
@@ -388,10 +390,13 @@ contains(Set, X) = pred_to_bool(contains(Set, X)).
 
 start_reply_to_message_id(Config, Crypto, Screen, MessageId, ReplyKind,
         Transition, !IO) :-
-    run_notmuch(Config, [
-        "show", "--format=json", "--part=0", "--",
-        message_id_to_search_term(MessageId)
-    ], parse_top_message, Res, !IO),
+    run_notmuch(Config,
+        [
+            "show", "--format=json", "--part=0", "--",
+            message_id_to_search_term(MessageId)
+        ],
+        no_suspend_curses,
+        parse_top_message, Res, !IO),
     (
         Res = ok(Message),
         (
@@ -429,7 +434,8 @@ continue_from_message(Config, Crypto, Screen, ContinueBase, Message, Transition,
         "show", "--format=raw", decrypt_arg(WasEncrypted),
         "--", message_id_to_search_term(MessageId)
     ], redirect_input("/dev/null"), no_redirect, Command),
-    call_system_capture_stdout(Command, no, CallRes, !IO),
+    % Decryption may invoke pinentry-curses.
+    curs.soft_suspend(call_system_capture_stdout(Command, no), CallRes, !IO),
     (
         CallRes = ok(String),
         parse_message(String, HeadersB, _Body),
@@ -475,7 +481,7 @@ first_text_part([Part | Parts], Text, AttachmentParts) :-
             first_text_part(SubParts, Text, AttachmentParts)
         ;
             Encryption = decryption_good,
-            filter(isnt(is_application_pgp_encrypted),
+            filter(isnt(part_is_application_pgp_encrypted),
                 SubParts, OtherSubParts),
             first_text_part(OtherSubParts, Text, AttachmentParts)
         )
@@ -486,6 +492,11 @@ first_text_part([Part | Parts], Text, AttachmentParts) :-
         first_text_part(Parts, Text, AttachmentParts0),
         AttachmentParts = [Part | AttachmentParts0]
     ).
+
+:- pred part_is_application_pgp_encrypted(part::in) is semidet.
+
+part_is_application_pgp_encrypted(Part) :-
+    Part ^ pt_type = mime_type.application_pgp_encrypted.
 
 :- pred to_old_attachment(part::in, attachment::out) is det.
 
@@ -500,7 +511,7 @@ to_old_attachment(Part, old_attachment(Part)).
 create_edit_stage(Config, Crypto, Screen, Headers0, Text0, Attachments,
         MaybeOldDraft, EncryptInit, SignInit, Transition, !IO) :-
     get_encrypt_by_default(Config, EncryptByDefault),
-    get_encrypt_by_default(Config, SignByDefault),
+    get_sign_by_default(Config, SignByDefault),
     CryptoInfo0 = init_crypto_info(Crypto,
         EncryptByDefault `or` EncryptInit,
         SignByDefault `or` SignInit),
@@ -568,11 +579,7 @@ make_parsed_headers(Headers, Parsed) :-
 call_editor(Config, Filename, Res, !IO) :-
     get_editor_command(Config, Editor),
     make_quoted_command(Editor, [Filename], no_redirect, no_redirect, Command),
-    curs.def_prog_mode(!IO),
-    curs.stop(!IO),
-    io.call_system(Command, CallRes, !IO),
-    curs.reset_prog_mode(!IO),
-    curs.refresh(!IO),
+    curs.suspend(io.call_system(Command), CallRes, !IO),
     (
         CallRes = ok(ExitStatus),
         ( ExitStatus = 0 ->
@@ -620,7 +627,7 @@ enter_staging(Config, Screen, Headers0, Text, Attachments, MaybeOldDraft,
         MaybeOldDraft, init_history),
     AttachInfo = scrollable.init_with_cursor(Attachments),
     get_cols(Screen, Cols),
-    setup_pager_for_staging(Config, Cols, Text, new_pager, PagerInfo),
+    setup_pager_for_staging(Cols, Text, new_pager, PagerInfo),
     staging_screen(Screen, StagingInfo, AttachInfo, PagerInfo, Transition,
         !CryptoInfo, !IO).
 
@@ -884,9 +891,8 @@ resize_staging_screen(Screen0, Screen, StagingInfo, PagerInfo0, PagerInfo,
     split_panels(Screen, _HeaderPanels, _AttachmentPanels, _MaybeSepPanel,
         PagerPanels),
     NumPagerRows = list.length(PagerPanels),
-    Config = StagingInfo ^ si_config,
     Text = StagingInfo ^ si_text,
-    setup_pager_for_staging(Config, Cols, Text,
+    setup_pager_for_staging(Cols, Text,
         retain_pager_pos(PagerInfo0, NumPagerRows), PagerInfo).
 
 %-----------------------------------------------------------------------------%
@@ -1101,15 +1107,14 @@ do_attach_file(FileName, NumRows, MessageUpdate, !AttachInfo, !IO) :-
     attach_info::in, attach_info::out, io::di, io::uo) is det.
 
 do_attach_file_2(FileName, NumRows, MessageUpdate, !AttachInfo, !IO) :-
-    lookup_mime_type(FileName, ResMimeType, !IO),
+    detect_mime_type(FileName, ResDetect, !IO),
     (
-        ResMimeType = ok(MimeType),
+        ResDetect = ok(mime_type_with_charset(Type, Charset)),
         ( dir.basename(FileName, BaseName0) ->
             BaseName = BaseName0
         ;
             BaseName = FileName
         ),
-        MimeType = mime_type(Type, Charset),
         ( Charset = "binary" ->
             do_attach_binary_file(FileName, BaseName, Type, NumRows,
                 MessageUpdate, !AttachInfo, !IO)
@@ -1121,7 +1126,7 @@ do_attach_file_2(FileName, NumRows, MessageUpdate, !AttachInfo, !IO) :-
                 "Only ASCII and UTF-8 text files supported yet.")
         )
     ;
-        ResMimeType = error(Error),
+        ResDetect = error(Error),
         Msg = io.error_message(Error),
         MessageUpdate = set_warning(Msg)
     ).
@@ -1133,7 +1138,7 @@ acceptable_charset(Charset) :-
     ; strcase_equal(Charset, "utf-8")
     ).
 
-:- pred do_attach_text_file(string::in, string::in, string::in, int::in,
+:- pred do_attach_text_file(string::in, string::in, mime_type::in, int::in,
     message_update::out, attach_info::in, attach_info::out, io::di, io::uo)
     is det.
 
@@ -1164,7 +1169,7 @@ do_attach_text_file(FileName, BaseName, Type, NumRows, MessageUpdate,
         MessageUpdate = set_warning(Msg)
     ).
 
-:- pred do_attach_binary_file(string::in, string::in, string::in, int::in,
+:- pred do_attach_binary_file(string::in, string::in, mime_type::in, int::in,
     message_update::out, attach_info::in, attach_info::out, io::di, io::uo)
     is det.
 
@@ -1221,18 +1226,19 @@ edit_attachment_type(Screen, !AttachInfo, !IO) :-
             History0 = init_history,
             add_history_nodup("application/octet-stream", History0, History1),
             add_history_nodup("text/plain", History1, History),
-            text_entry_full(Screen, "Media type: ", History, Type0,
+            TypeString0 = mime_type.to_string(Type0),
+            text_entry_full(Screen, "Media type: ", History, TypeString0,
                 complete_none, no, Return, !IO),
             (
-                Return = yes(Type),
-                Type \= ""
+                Return = yes(TypeString),
+                TypeString \= ""
             ->
-                ( accept_media_type(Type) ->
+                ( accept_media_type(TypeString, Type) ->
                     Attachment = new_attachment(Type, Content, FileName, Size),
                     scrollable.set_cursor_line(Attachment, !AttachInfo),
                     MessageUpdate = clear_message
                 ;
-                    Msg = "Refusing to set media type: " ++ Type,
+                    Msg = "Refusing to set media type: " ++ TypeString,
                     MessageUpdate = set_warning(Msg)
                 )
             ;
@@ -1248,22 +1254,19 @@ edit_attachment_type(Screen, !AttachInfo, !IO) :-
     ),
     update_message(Screen, MessageUpdate, !IO).
 
-:- pred accept_media_type(string::in) is semidet.
+:- pred accept_media_type(string::in, mime_type::out) is semidet.
 
-accept_media_type(String) :-
-    [Type, SubType] = string.split_at_char('/', String),
-    string.to_lower(Type, LowerType),
-    ( LowerType = "application"
-    ; LowerType = "audio"
-    ; LowerType = "image"
-   %; LowerType = "message"
-    ; LowerType = "model"
-   %; LowerType = "multipart"
-    ; LowerType = "text"
-    ; LowerType = "video"
-    ),
-    SubType \= "",
-    string.all_match(token_char, SubType).
+accept_media_type(String, MimeType) :-
+    parse_mime_type(String, MimeType, Type, _SubType),
+    ( Type = "application"
+    ; Type = "audio"
+    ; Type = "image"
+   %; Type = "message"
+    ; Type = "model"
+   %; Type = "multipart"
+    ; Type = "text"
+    ; Type = "video"
+    ).
 
 %-----------------------------------------------------------------------------%
 
@@ -1619,7 +1622,7 @@ draw_attachment_line(Attrs, Panel, Attachment, LineNr, IsCursor, !IO) :-
         FilenameAttr = Attr
     ),
     draw(Panel, FilenameAttr, Filename, !IO),
-    draw(Panel, Attr, " (" ++ Type ++ ")", !IO),
+    draw(Panel, Attr, " (" ++ mime_type.to_string(Type) ++ ")", !IO),
     ( Size >= 1024 * 1024 ->
         SizeM = float(Size) / (1024.0 * 1024.0),
         draw(Panel, format(" %.1f MiB", [f(SizeM)]), !IO)
@@ -1817,7 +1820,8 @@ call_send_mail(Config, Account, Filename, Res, !IO) :-
     get_sendmail_command(Account, sendmail_read_recipients, Sendmail),
     make_quoted_command(Sendmail, [], redirect_input(Filename), no_redirect,
         Command),
-    io.call_system(Command, ResSend, !IO),
+    % e.g. msmtp 'passwordeval' option may invoke pinentry-curses.
+    curs.soft_suspend(io.call_system(Command), ResSend, !IO),
     (
         ResSend = ok(ExitStatus),
         ( ExitStatus = 0 ->
@@ -1856,7 +1860,7 @@ do_post_sendmail(Config, Account, Filename, Res, !IO) :-
         Action = command(CommandPrefix),
         make_quoted_command(CommandPrefix, [], redirect_input(Filename),
             no_redirect, Command),
-        io.call_system(Command, ResCall, !IO),
+        curs.soft_suspend(io.call_system(Command), ResCall, !IO),
         (
             ResCall = ok(ExitStatus),
             ( ExitStatus = 0 ->
@@ -1911,12 +1915,14 @@ create_temp_message_file(Config, Prepare, Headers, ParsedHeaders, Text,
     splitmix64.init(truncate_to_int(Seed), RS0),
     get_message_id_right_part(Config, MessageIdRight),
     generate_date_msg_id(MessageIdRight, Date, MessageId, !IO),
-    generate_headers(Prepare, Headers, ParsedHeaders, Date, MessageId,
+    make_headers(Prepare, Headers, ParsedHeaders, Date, MessageId,
         WriteHeaders),
     (
         Prepare = prepare_edit,
         Spec = message_spec(WriteHeaders, plain(plain_body(Text))),
-        write_temp_message_file(Config, Prepare, Spec, Res, !IO),
+        curs.soft_suspend(
+            write_temp_message_file(Config, Prepare, Spec, i_paused_curses),
+            Res, !IO),
         Warnings = []
     ;
         (
@@ -1933,10 +1939,13 @@ create_temp_message_file(Config, Prepare, Headers, ParsedHeaders, Text,
         (
             Encrypt = no,
             Sign = no,
-            generate_mime_part(cte_8bit, Text, Attachments, MimePart,
-                RS0, _RS),
+            generate_boundary(MixedBoundary, RS0, _RS),
+            make_text_and_attachments_mime_part(cte_8bit, Text, Attachments,
+                boundary(MixedBoundary), MimePart),
             Spec = message_spec(WriteHeaders, mime_v1(MimePart)),
-            write_temp_message_file(Config, Prepare, Spec, Res, !IO),
+            curs.soft_suspend(
+                write_temp_message_file(Config, Prepare, Spec,
+                    i_paused_curses), Res, !IO),
             Warnings = []
         ;
             Encrypt = yes,
@@ -1967,31 +1976,21 @@ create_temp_message_file(Config, Prepare, Headers, ParsedHeaders, Text,
                 EncryptKeys = [_ | _],
                 missing_keys_warning(Missing, WarningsA),
                 leaked_bccs_warning(LeakedBccs, WarningsB),
-                generate_mime_part(TextCTE, Text, Attachments, PartToEncrypt,
-                    RS0, RS1),
-                % XXX encrypt could return Cipher as a data buffer instead of
-                % returning it as a string
-                encrypt(CryptoInfo, MaybeSigners, EncryptKeys, Config,
-                    PartToEncrypt, ResCipher, WarningsC, !IO),
-                (
-                    ResCipher = ok(Cipher),
-                    generate_multipart_encrypted(Cipher, MimePart, RS1, _RS),
-                    Spec = message_spec(WriteHeaders, mime_v1(MimePart)),
-                    write_temp_message_file(Config, Prepare, Spec, Res, !IO),
-                    Warnings = WarningsA ++ WarningsB ++ WarningsC
-                ;
-                    ResCipher = error(Error),
-                    Res = error("Encryption failed: " ++ Error),
-                    Warnings = []
-                )
+                generate_boundary(MixedBoundary, RS0, RS1),
+                make_text_and_attachments_mime_part(TextCTE, Text, Attachments,
+                    boundary(MixedBoundary), PartToEncrypt),
+                generate_boundary(EncryptedBoundary, RS1, _RS),
+                curs.soft_suspend(
+                    encrypt_then_write_temp_message_file(Config, Prepare,
+                        WriteHeaders, PartToEncrypt,
+                        CryptoInfo, MaybeSigners, EncryptKeys,
+                        boundary(EncryptedBoundary), i_paused_curses),
+                    {Res, WarningsC}, !IO),
+                Warnings = WarningsA ++ WarningsB ++ WarningsC
             )
         ;
             Encrypt = no,
             Sign = yes,
-            % Force text parts to be base64-encoded to avoid being mangled
-            % during transfer.
-            generate_mime_part(cte_base64, Text, Attachments, PartToSign,
-                RS0, RS1),
             get_sign_keys(CryptoInfo, ParsedHeaders, SignKeys),
             (
                 SignKeys = [],
@@ -1999,31 +1998,27 @@ create_temp_message_file(Config, Prepare, Headers, ParsedHeaders, Text,
                 Warnings = []
             ;
                 SignKeys = [_ | _],
-                % XXX sign_detached converts PartToSign into a a data buffer,
-                % then we convert it again when writing to the temp file
-                sign_detached(CryptoInfo, SignKeys, Config, PartToSign,
-                    ResSign, Warnings, !IO),
-                (
-                    ResSign = ok(Sig - MicAlg),
-                    generate_multipart_signed(PartToSign, Sig, MicAlg,
-                        MimeMessage, RS1, _RS),
-                    Spec = message_spec(WriteHeaders, mime_v1(MimeMessage)),
-                    write_temp_message_file(Config, Prepare, Spec, Res, !IO)
-                ;
-                    ResSign = error(Error),
-                    Res = error("Signing failed: " ++ Error)
-                )
+                % Force text parts to be base64-encoded to avoid being mangled
+                % during transfer.
+                generate_boundary(MixedBoundary, RS0, RS1),
+                make_text_and_attachments_mime_part(cte_base64, Text, Attachments,
+                    boundary(MixedBoundary), PartToSign),
+                generate_boundary(SignedBoundary, RS1, _RS),
+                curs.soft_suspend(
+                    sign_detached_then_write_temp_message_file(Config, Prepare,
+                        WriteHeaders, PartToSign, CryptoInfo, SignKeys,
+                        boundary(SignedBoundary), i_paused_curses),
+                    {Res, Warnings}, !IO)
             )
         )
     ).
 
 %-----------------------------------------------------------------------------%
 
-:- pred generate_headers(prepare_temp::in, headers::in, parsed_headers::in,
+:- pred make_headers(prepare_temp::in, headers::in, parsed_headers::in,
     header_value::in, header_value::in, list(header)::out) is det.
 
-generate_headers(Prepare, Headers, ParsedHeaders, Date, MessageId,
-        WriteHeaders) :-
+make_headers(Prepare, Headers, ParsedHeaders, Date, MessageId, WriteHeaders) :-
     Headers = headers(_Date, _From, _To, _Cc, _Bcc, Subject, _ReplyTo,
         References, InReplyTo, RestHeaders),
     ParsedHeaders = parsed_headers(From, To, Cc, Bcc, ReplyTo),
@@ -2110,39 +2105,38 @@ maybe_cons_unstructured(SkipEmpty, Options, FieldName, Value, !Acc) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred generate_mime_part(content_transfer_encoding::in, string::in,
-    list(attachment)::in, mime_part::out, splitmix64::in, splitmix64::out)
-    is det.
+:- pred make_text_and_attachments_mime_part(content_transfer_encoding::in,
+    string::in, list(attachment)::in, boundary::in, mime_part::out) is det.
 
-generate_mime_part(TextCTE, Text, Attachments, MimePart, !RS) :-
-    generate_text_mime_part(inline, TextCTE, Text, TextPart),
+make_text_and_attachments_mime_part(TextCTE, Text, Attachments, MixedBoundary,
+        MimePart) :-
+    make_text_mime_part(inline, TextCTE, Text, TextPart),
     (
         Attachments = [],
         MimePart = TextPart
     ;
         Attachments = [_ | _],
-        generate_boundary(Boundary, !RS),
-        MimePart = composite(multipart_mixed, boundary(Boundary), yes(inline),
+        MimePart = composite(multipart_mixed, MixedBoundary, yes(inline),
             yes(cte_8bit), [TextPart | AttachmentParts]),
-        list.map(generate_attachment_mime_part(TextCTE), Attachments,
+        list.map(make_attachment_mime_part(TextCTE), Attachments,
             AttachmentParts)
     ).
 
-:- pred generate_text_mime_part(content_disposition::in,
+:- pred make_text_mime_part(content_disposition::in,
     content_transfer_encoding::in, string::in, mime_part::out) is det.
 
-generate_text_mime_part(Disposition, TextCTE, Text, MimePart) :-
+make_text_mime_part(Disposition, TextCTE, Text, MimePart) :-
     % XXX detect charset
     MimePart = discrete(text_plain(yes(utf8)), yes(Disposition), yes(TextCTE),
         text(Text)).
 
-:- pred generate_attachment_mime_part(content_transfer_encoding::in,
+:- pred make_attachment_mime_part(content_transfer_encoding::in,
     attachment::in, mime_part::out) is det.
 
-generate_attachment_mime_part(TextCTE, Attachment, MimePart) :-
+make_attachment_mime_part(TextCTE, Attachment, MimePart) :-
     (
         Attachment = old_attachment(OldPart),
-        OldType = OldPart ^ pt_type,
+        OldType = mime_type.to_string(OldPart ^ pt_type),
         OldContent = OldPart ^ pt_content,
         MaybeFileName = OldPart ^ pt_filename,
         (
@@ -2172,44 +2166,91 @@ generate_attachment_mime_part(TextCTE, Attachment, MimePart) :-
         Disposition = attachment(yes(filename(FileName))),
         (
             Content = text(Text),
-            generate_text_mime_part(Disposition, TextCTE, Text, MimePart)
+            make_text_mime_part(Disposition, TextCTE, Text, MimePart)
         ;
             Content = binary_base64(Base64),
-            MimePart = discrete(content_type(Type), yes(Disposition),
+            TypeString = mime_type.to_string(Type),
+            MimePart = discrete(content_type(TypeString), yes(Disposition),
                 yes(cte_base64), base64(Base64))
         )
     ).
 
 %-----------------------------------------------------------------------------%
 
-:- pred generate_multipart_encrypted(string::in, mime_part::out,
-    splitmix64::in, splitmix64::out) is det.
+:- pred encrypt_then_write_temp_message_file(prog_config::in, prepare_temp::in,
+    list(header)::in, mime_part::in,
+    crypto_info::in, maybe(list(gpgme.key))::in, list(gpgme.key)::in,
+    boundary::in, i_paused_curses::in,
+    {maybe_error(string), list(string)}::out, io::di, io::uo) is det.
 
-generate_multipart_encrypted(Cipher, MultiPart, !RS) :-
+encrypt_then_write_temp_message_file(Config, Prepare, WriteHeaders,
+        PartToEncrypt, CryptoInfo, MaybeSigners, EncryptKeys, EncryptedBoundary,
+        PausedCurs, {Res, Warnings}, !IO) :-
+    % XXX encrypt could return Cipher as a data buffer instead of returning it
+    % as a string
+    encrypt(CryptoInfo, MaybeSigners, EncryptKeys, Config, PartToEncrypt,
+        PausedCurs, ResCipher, Warnings, !IO),
+    (
+        ResCipher = ok(Cipher),
+        make_multipart_encrypted_mime_part(Cipher, EncryptedBoundary,
+            MimePart),
+        Spec = message_spec(WriteHeaders, mime_v1(MimePart)),
+        write_temp_message_file(Config, Prepare, Spec, PausedCurs, Res, !IO)
+    ;
+        ResCipher = error(Error),
+        Res = error("Encryption failed: " ++ Error)
+    ).
+
+:- pred sign_detached_then_write_temp_message_file(prog_config::in,
+    prepare_temp::in, list(header)::in, mime_part::in,
+    crypto_info::in, list(gpgme.key)::in, boundary::in, i_paused_curses::in,
+    {maybe_error(string), list(string)}::out, io::di, io::uo) is det.
+
+sign_detached_then_write_temp_message_file(Config, Prepare,
+        WriteHeaders, PartToSign, CryptoInfo, SignKeys, MultiPartBoundary,
+        PausedCurs, {Res, Warnings}, !IO) :-
+    % XXX sign_detached converts PartToSign into a a data buffer, then we
+    % convert it again when writing to the temp file
+    sign_detached(CryptoInfo, SignKeys, Config, PartToSign, PausedCurs,
+        ResSign, Warnings, !IO),
+    (
+        ResSign = ok(Sig - MicAlg),
+        make_multipart_signed_mime_part(PartToSign, Sig, MicAlg,
+            MultiPartBoundary, MimeMessage),
+        Spec = message_spec(WriteHeaders, mime_v1(MimeMessage)),
+        write_temp_message_file(Config, Prepare, Spec, PausedCurs, Res, !IO)
+    ;
+        ResSign = error(Error),
+        Res = error("Signing failed: " ++ Error)
+    ).
+
+:- pred make_multipart_encrypted_mime_part(string::in, boundary::in,
+    mime_part::out) is det.
+
+make_multipart_encrypted_mime_part(Cipher, Boundary, MultiPart) :-
     % RFC 3156
-    generate_boundary(Boundary, !RS),
     MultiPart = composite(multipart_encrypted(application_pgp_encrypted),
-        boundary(Boundary), no, no, [SubPartA, SubPartB]),
+        Boundary, no, no, [SubPartA, SubPartB]),
     SubPartA = discrete(application_pgp_encrypted, no, no,
         text("Version: 1\n")),
     SubPartB = discrete(application_octet_stream, no, no, text(Cipher)).
 
-:- pred generate_multipart_signed(mime_part::in, string::in, micalg::in,
-    mime_part::out, splitmix64::in, splitmix64::out) is det.
+:- pred make_multipart_signed_mime_part(mime_part::in, string::in, micalg::in,
+    boundary::in, mime_part::out) is det.
 
-generate_multipart_signed(SignedPart, Sig, MicAlg, MultiPart, !RS) :-
+make_multipart_signed_mime_part(SignedPart, Sig, MicAlg, Boundary, MultiPart) :-
     % RFC 3156
-    generate_boundary(Boundary, !RS),
     MultiPart = composite(multipart_signed(MicAlg, application_pgp_signature),
-        boundary(Boundary), no, no, [SignedPart, SignaturePart]),
+        Boundary, no, no, [SignedPart, SignaturePart]),
     SignaturePart = discrete(application_pgp_signature, no, no, text(Sig)).
 
 %-----------------------------------------------------------------------------%
 
 :- pred write_temp_message_file(prog_config::in, prepare_temp::in,
-    message_spec::in, maybe_error(string)::out, io::di, io::uo) is det.
+    message_spec::in, i_paused_curses::in, maybe_error(string)::out,
+    io::di, io::uo) is det.
 
-write_temp_message_file(Config, Prepare, Spec, Res, !IO) :-
+write_temp_message_file(Config, Prepare, Spec, PausedCurs, Res, !IO) :-
     make_temp_suffix("", Res0, !IO),
     (
         Res0 = ok(Filename),
@@ -2217,7 +2258,7 @@ write_temp_message_file(Config, Prepare, Spec, Res, !IO) :-
         (
             ResOpen = ok(Stream),
             write_message(Stream, Config, Spec, allow_header_error(Prepare),
-                ResWrite, !IO),
+                PausedCurs, ResWrite, !IO),
             io.close_output(Stream, !IO),
             (
                 ResWrite = ok,

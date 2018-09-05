@@ -43,17 +43,18 @@
 :- import_module curs.
 :- import_module curs.panel.
 :- import_module data.
+:- import_module poll_notify.
 :- import_module quote_arg.
 :- import_module recall.
 :- import_module scrollable.
 :- import_module search_term.
 :- import_module signal.
-:- import_module sleep.
 :- import_module string_util.
 :- import_module tags.
 :- import_module text_entry.
 :- import_module thread_pager.
 :- import_module time_util.
+:- import_module view_async.
 
 %-----------------------------------------------------------------------------%
 
@@ -62,6 +63,7 @@
                 i_config            :: prog_config,
                 i_crypto            :: crypto,
                 i_scrollable        :: scrollable(index_line),
+                % XXX clarify "notmuch search" vs search string
                 i_search_terms      :: string,
                 i_search_tokens     :: list(token),
                 i_search_time       :: timestamp,
@@ -80,8 +82,8 @@
                 i_authors   :: string,
                 i_subject   :: string,
                 i_tags      :: set(tag),
-                i_std_tags  :: standard_tags, % overrides i_tags
-                i_nonstd_tags_width :: int,
+                i_std_tags  :: standard_tags, % cached from i_tags
+                i_nonstd_tags_width :: int,   % cached from i_nonstd_tags_width
                 i_matched   :: int,
                 i_total     :: int
             ).
@@ -111,6 +113,7 @@
     ;       prompt_internal_search(search_direction)
     ;       skip_to_internal_search
     ;       toggle_unread
+    ;       toggle_archive
     ;       toggle_flagged
     ;       set_deleted
     ;       unset_deleted
@@ -133,6 +136,7 @@
     ;       addressbook_add
     ;       prompt_internal_search(search_direction)
     ;       toggle_unread
+    ;       toggle_archive
     ;       toggle_flagged
     ;       set_deleted
     ;       unset_deleted
@@ -198,7 +202,7 @@ open_index(Config, Crypto, Screen, SearchString, !.CommonHistory, !IO) :-
     IndexInfo = index_info(Config, Crypto, Scrollable, SearchString,
         SearchTokens, SearchTime, NextPollTime, PollCount, MaybeSearch,
         dir_forward, !.CommonHistory),
-    index_loop(Screen, IndexInfo, !IO).
+    index_loop(Screen, redraw, IndexInfo, !IO).
 
 :- pred search_terms_with_progress(prog_config::in, screen::in,
     list(token)::in, maybe(list(thread))::out, io::di, io::uo) is det.
@@ -225,6 +229,7 @@ search_terms_quiet(Config, Tokens, MaybeThreads, MessageUpdate, !IO) :-
     run_notmuch(Config,
         ["search", "--format=json", "--exclude=all" | LimitOption]
         ++ ["--", Terms],
+        no_suspend_curses,
         parse_threads_list, ResThreads, !IO),
     ignore_sigint(no, !IO),
     (
@@ -288,51 +293,64 @@ default_max_threads = 300.
 
 %-----------------------------------------------------------------------------%
 
-:- pred index_loop(screen::in, index_info::in, io::di, io::uo) is det.
+:- type on_entry
+    --->    redraw
+    ;       no_draw.
 
-index_loop(Screen, IndexInfo, !IO) :-
-    draw_index_view(Screen, IndexInfo, !IO),
-    draw_index_bar(Screen, IndexInfo, !IO),
-    panel.update_panels(!IO),
-    index_loop_no_draw(Screen, IndexInfo, !IO).
-
-:- pred index_loop_no_draw(screen::in, index_info::in, io::di, io::uo)
+:- pred index_loop(screen::in, on_entry::in, index_info::in, io::di, io::uo)
     is det.
-:- pragma inline(index_loop_no_draw/4).
 
-index_loop_no_draw(Screen, !.IndexInfo, !IO) :-
-    poll_async_with_progress(Screen, !IndexInfo, !IO),
-    index_get_keycode(!.IndexInfo, KeyCode, !IO),
+index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
+    (
+        OnEntry = redraw,
+        draw_index_view(Screen, !.IndexInfo, !IO),
+        draw_index_bar(Screen, !.IndexInfo, !IO),
+        panel.update_panels(!IO)
+    ;
+        OnEntry = no_draw
+    ),
+
+    poll_async_with_progress(Screen, handle_poll_result, !IndexInfo, !IO),
+    get_keycode_async_aware(!.IndexInfo ^ i_next_poll_time, KeyCode, !IO),
     index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo),
     update_message(Screen, MessageUpdate, !IO),
 
     (
         Action = continue,
         maybe_sched_poll(!IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = continue_no_draw,
         maybe_sched_poll(!IndexInfo, !IO),
-        index_loop_no_draw(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, no_draw, !.IndexInfo, !IO)
     ;
         Action = resize,
         replace_screen_for_resize(Screen, NewScreen, !IO),
         recreate_screen(NewScreen, !IndexInfo),
-        index_loop(NewScreen, !.IndexInfo, !IO)
+        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
     ;
         Action = open_pager(ThreadId),
         flush_async_with_progress(Screen, !IO),
         Config = !.IndexInfo ^ i_config,
         Crypto = !.IndexInfo ^ i_crypto,
-        MaybeSearch = !.IndexInfo ^ i_internal_search,
+        Tokens = !.IndexInfo ^ i_search_tokens,
+        index_poll_terms(Tokens, IndexPollTerms, !IO),
         CommonHistory0 = !.IndexInfo ^ i_common_history,
-        open_thread_pager(Config, Crypto, Screen, ThreadId, MaybeSearch,
-            Transition, CommonHistory0, CommonHistory, !IO),
+        % Use the last search string that was entered in any view, not
+        % necessarily the active search string in the index view.
+        SearchHistory = CommonHistory0 ^ ch_internal_search_history,
+        ( history_latest(SearchHistory, LastSearchString) ->
+            MaybeSearch = yes(LastSearchString)
+        ;
+            MaybeSearch = no
+        ),
+        open_thread_pager(Config, Crypto, Screen, ThreadId, IndexPollTerms,
+            MaybeSearch, Transition, CommonHistory0, CommonHistory, !IO),
         handle_screen_transition(Screen, NewScreen, Transition,
             TagUpdates, !IndexInfo, !IO),
         effect_thread_pager_changes(TagUpdates, !IndexInfo, !IO),
         !IndexInfo ^ i_common_history := CommonHistory,
-        index_loop(NewScreen, !.IndexInfo, !IO)
+        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
     ;
         Action = enter_limit(MaybeInitial),
         Config = !.IndexInfo ^ i_config,
@@ -380,11 +398,11 @@ index_loop_no_draw(Screen, !.IndexInfo, !IO) :-
             Return = no,
             update_message(Screen, clear_message, !IO)
         ),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = refresh_all,
         refresh_all(Screen, verbose, !IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = start_compose,
         flush_async_with_progress(Screen, !IO),
@@ -406,7 +424,7 @@ index_loop_no_draw(Screen, !.IndexInfo, !IO) :-
         ;
             Sent = not_sent
         ),
-        index_loop(NewScreen, !.IndexInfo, !IO)
+        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
     ;
         Action = start_reply(ReplyKind),
         flush_async_with_progress(Screen, !IO),
@@ -418,7 +436,7 @@ index_loop_no_draw(Screen, !.IndexInfo, !IO) :-
         ;
             MaybeRefresh = no
         ),
-        index_loop(NewScreen, !.IndexInfo, !IO)
+        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
     ;
         Action = start_recall,
         flush_async_with_progress(Screen, !IO),
@@ -429,35 +447,39 @@ index_loop_no_draw(Screen, !.IndexInfo, !IO) :-
         ;
             Sent = not_sent
         ),
-        index_loop(NewScreen, !.IndexInfo, !IO)
+        index_loop(NewScreen, redraw, !.IndexInfo, !IO)
     ;
         Action = addressbook_add,
         addressbook_add(Screen, !.IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = prompt_internal_search(SearchDir),
         prompt_internal_search(Screen, SearchDir, !IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = toggle_unread,
         modify_tag_cursor_line(toggle_unread, Screen, !IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
+    ;
+        Action = toggle_archive,
+        modify_tag_cursor_line(toggle_archive, Screen, !IndexInfo, !IO),
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = toggle_flagged,
         modify_tag_cursor_line(toggle_flagged, Screen, !IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = set_deleted,
         modify_tag_cursor_line(set_deleted, Screen, !IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = unset_deleted,
         modify_tag_cursor_line(unset_deleted, Screen, !IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = prompt_tag(Initial),
         prompt_tag(Screen, Initial, !IndexInfo, !IO),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = bulk_tag(KeepSelection),
         bulk_tag(Screen, Done, !IndexInfo, !IO),
@@ -469,55 +491,10 @@ index_loop_no_draw(Screen, !.IndexInfo, !IO) :-
         ;
             true
         ),
-        index_loop(Screen, !.IndexInfo, !IO)
+        index_loop(Screen, redraw, !.IndexInfo, !IO)
     ;
         Action = quit,
         flush_async_with_progress(Screen, !IO)
-    ).
-
-:- pred index_get_keycode(index_info::in, keycode::out, io::di, io::uo) is det.
-
-index_get_keycode(Info, Code, !IO) :-
-    async.have_child_process(HaveChild, !IO),
-    (
-        HaveChild = yes,
-        Tenths = 10,
-        get_keycode_child_process_loop(Tenths, Code, !IO)
-    ;
-        HaveChild = no,
-        MaybeNextPollTime = Info ^ i_next_poll_time,
-        (
-            MaybeNextPollTime = yes(NextPollTime),
-            current_timestamp(Time, !IO),
-            DeltaSecs = NextPollTime - Time,
-            ( DeltaSecs =< 0.0 ->
-                Tenths = 10
-            ;
-                Tenths = 10 * floor_to_int(DeltaSecs) + 1
-            ),
-            get_keycode_timeout(Tenths, Code, !IO)
-        ;
-            MaybeNextPollTime = no,
-            get_keycode_blocking(Code, !IO)
-        )
-    ).
-
-:- pred get_keycode_child_process_loop(int::in, keycode::out,
-    io::di, io::uo) is det.
-
-get_keycode_child_process_loop(Tenths, Code, !IO) :-
-    get_keycode_timeout(Tenths, Code0, !IO),
-    ( Code0 = timeout_or_error ->
-        async.received_sigchld_since_spawn(Sigchld, !IO),
-        (
-            Sigchld = yes,
-            Code = Code0
-        ;
-            Sigchld = no,
-            get_keycode_child_process_loop(Tenths, Code, !IO)
-        )
-    ;
-        Code = Code0
     ).
 
 %-----------------------------------------------------------------------------%
@@ -618,6 +595,10 @@ index_view_input(Screen, KeyCode, MessageUpdate, Action, !IndexInfo) :-
             MessageUpdate = no_change,
             Action = toggle_unread
         ;
+            Binding = toggle_archive,
+            MessageUpdate = no_change,
+            Action = toggle_archive
+        ;
             Binding = toggle_flagged,
             MessageUpdate = no_change,
             Action = toggle_flagged
@@ -692,6 +673,7 @@ key_binding_char('G', end).
 key_binding_char('(', half_page_up).
 key_binding_char(')', half_page_down).
 key_binding_char('\t', skip_to_unread).
+key_binding_char(',', skip_to_unread).
 key_binding_char('\r', enter).
 key_binding_char('l', enter_limit).
 key_binding_char('~', enter_limit_tilde).
@@ -700,11 +682,12 @@ key_binding_char('r', start_reply(direct_reply)).
 key_binding_char('e', start_reply(group_reply)).
 key_binding_char('L', start_reply(list_reply)).
 key_binding_char('R', start_recall).
-key_binding_char('a', addressbook_add).
+key_binding_char('@', addressbook_add).
 key_binding_char('/', prompt_internal_search(dir_forward)).
 key_binding_char('?', prompt_internal_search(dir_reverse)).
 key_binding_char('n', skip_to_internal_search).
 key_binding_char('N', toggle_unread).
+key_binding_char('a', toggle_archive).
 key_binding_char('F', toggle_flagged).
 key_binding_char('d', set_deleted).
 key_binding_char('u', unset_deleted).
@@ -788,7 +771,7 @@ effect_thread_pager_changes(Effects, !Info, !IO) :-
     Effects = thread_pager_effects(TagSet, TagGroups, AddedMessages),
     Scrollable0 = !.Info ^ i_scrollable,
     ( get_cursor_line(Scrollable0, _, CursorLine0) ->
-        set_index_line_tags(TagSet, CursorLine0, CursorLine1),
+        set_tags(TagSet, CursorLine0, CursorLine1),
         % Increment the total number of messages.  Too bad we don't know if the
         % matched number should be increased as well.
         Total1 = CursorLine1 ^ i_total,
@@ -800,16 +783,6 @@ effect_thread_pager_changes(Effects, !Info, !IO) :-
     ;
         unexpected($module, $pred, "cursor not on expected line")
     ).
-
-:- pred set_index_line_tags(set(tag)::in, index_line::in, index_line::out)
-    is det.
-
-set_index_line_tags(TagSet, Line0, Line) :-
-    Line0 = index_line(ThreadId, Selected, Date, Authors, Subject,
-        _TagSet0, _StdTags0, _NonstdTagsWidth, Matched, Total),
-    get_standard_tags(TagSet, StdTags, NonstdTagsWidth),
-    Line = index_line(ThreadId, Selected, Date, Authors, Subject,
-        TagSet, StdTags, NonstdTagsWidth, Matched, Total).
 
 %-----------------------------------------------------------------------------%
 
@@ -878,7 +851,8 @@ try_reply(!Screen, ThreadId, RequireUnread, ReplyKind, Res, !Info, !IO) :-
     ],
     Config = !.Info ^ i_config,
     Crypto = !.Info ^ i_crypto,
-    run_notmuch(Config, Args, parse_message_id_list, ListRes, !IO),
+    run_notmuch(Config, Args, no_suspend_curses,
+        parse_message_id_list, ListRes, !IO),
     (
         ListRes = ok(MessageIds),
         ( MessageIds = [MessageId] ->
@@ -936,12 +910,16 @@ addressbook_add(Screen, Info, !IO) :-
             "search", "--format=json", "--output=messages", "--exclude=all",
             "--", thread_id_to_search_term(ThreadId)
         ],
-        run_notmuch(Config, Args, parse_message_id_list, ListRes, !IO),
+        run_notmuch(Config, Args, no_suspend_curses,
+            parse_message_id_list, ListRes, !IO),
         ( ListRes = ok([MessageId | _]) ->
-            run_notmuch(Config, [
-                "show", "--format=json", "--part=0", "--",
-                message_id_to_search_term(MessageId)
-            ], parse_top_message, MessageRes, !IO),
+            run_notmuch(Config,
+                [
+                    "show", "--format=json", "--part=0", "--",
+                    message_id_to_search_term(MessageId)
+                ],
+                no_suspend_curses,
+                parse_top_message, MessageRes, !IO),
             (
                 MessageRes = ok(Message),
                 From = Message ^ m_headers ^ h_from
@@ -1054,7 +1032,7 @@ line_matches_internal_search(Search, Line) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred modify_tag_cursor_line(pred(index_line, index_line, tag_delta),
+:- pred modify_tag_cursor_line(pred(index_line, index_line, list(tag_delta)),
     screen, index_info, index_info, io, io).
 :- mode modify_tag_cursor_line(in(pred(in, out, out) is det),
     in, in, out, di, uo) is det.
@@ -1065,9 +1043,9 @@ modify_tag_cursor_line(ModifyPred, Screen, !Info, !IO) :-
     Scrollable0 = !.Info ^ i_scrollable,
     ( get_cursor_line(Scrollable0, _Cursor0, CursorLine0) ->
         ThreadId = CursorLine0 ^ i_id,
-        ( ModifyPred(CursorLine0, CursorLine, TagDelta) ->
+        ( ModifyPred(CursorLine0, CursorLine, TagDeltas) ->
             Config = !.Info ^ i_config,
-            async_tag_threads(Config, [TagDelta], [ThreadId], !IO),
+            async_tag_threads(Config, TagDeltas, [ThreadId], !IO),
             set_cursor_line(CursorLine, Scrollable0, Scrollable),
             !Info ^ i_scrollable := Scrollable,
             move_cursor(Screen, 1, _MessageUpdate, !Info),
@@ -1080,51 +1058,95 @@ modify_tag_cursor_line(ModifyPred, Screen, !Info, !IO) :-
     ),
     update_message(Screen, MessageUpdate, !IO).
 
-:- pred toggle_unread(index_line::in, index_line::out, tag_delta::out) is det.
+:- pred toggle_unread(index_line::in, index_line::out, list(tag_delta)::out)
+    is det.
 
-toggle_unread(Line0, Line, TagDelta) :-
+toggle_unread(Line0, Line, [TagDelta]) :-
     Unread0 = Line0 ^ i_std_tags ^ unread,
     (
         Unread0 = unread,
-        TagDelta = tag_delta("-unread"),
-        Unread = read
+        remove_tag(tag("unread"), Line0, Line),
+        TagDelta = tag_delta("-unread")
     ;
         Unread0 = read,
-        TagDelta = tag_delta("+unread"),
-        Unread = unread
-    ),
-    Line = Line0 ^ i_std_tags ^ unread := Unread.
+        add_tag(tag("unread"), Line0, Line),
+        TagDelta = tag_delta("+unread")
+    ).
 
-:- pred toggle_flagged(index_line::in, index_line::out, tag_delta::out)
+:- pred toggle_archive(index_line::in, index_line::out, list(tag_delta)::out)
+    is det.
+
+toggle_archive(Line0, Line, TagDeltas) :-
+    TagSet0 = Line0 ^ i_tags,
+    (
+        ( set.contains(TagSet0, tag("inbox"))
+        ; set.contains(TagSet0, tag("unread"))
+        )
+    ->
+        set.delete_list([tag("inbox"), tag("unread")], TagSet0, TagSet),
+        TagDeltas = [tag_delta("-inbox"), tag_delta("-unread")]
+    ;
+        set.insert(tag("inbox"), TagSet0, TagSet),
+        TagDeltas = [tag_delta("+inbox")]
+    ),
+    set_tags(TagSet, Line0, Line).
+
+:- pred toggle_flagged(index_line::in, index_line::out, list(tag_delta)::out)
     is semidet.
 
-toggle_flagged(Line0, Line, TagDelta) :-
+toggle_flagged(Line0, Line, [TagDelta]) :-
     Flagged0 = Line0 ^ i_std_tags ^ flagged,
     (
         Flagged0 = flagged,
         TagDelta = tag_delta("-flagged"),
-        Flagged = unflagged
+        remove_tag(tag("flagged"), Line0, Line)
     ;
         Flagged0 = unflagged,
         TagDelta = tag_delta("+flagged"),
-        Flagged = flagged,
         % Refuse to flag multiple messages.
         NumMessages = Line0 ^ i_total,
-        NumMessages = 1
-    ),
-    Line = Line0 ^ i_std_tags ^ flagged := Flagged.
+        NumMessages = 1,
+        add_tag(tag("flagged"), Line0, Line)
+    ).
 
-:- pred set_deleted(index_line::in, index_line::out, tag_delta::out) is det.
+:- pred set_deleted(index_line::in, index_line::out, list(tag_delta)::out)
+    is det.
 
-set_deleted(Line0, Line, TagDelta) :-
-    Line = Line0 ^ i_std_tags ^ deleted := deleted,
+set_deleted(!Line, [TagDelta]) :-
+    add_tag(tag("deleted"), !Line),
     TagDelta = tag_delta("+deleted").
 
-:- pred unset_deleted(index_line::in, index_line::out, tag_delta::out) is det.
+:- pred unset_deleted(index_line::in, index_line::out, list(tag_delta)::out)
+    is det.
 
-unset_deleted(Line0, Line, TagDelta) :-
-    Line = Line0 ^ i_std_tags ^ deleted := not_deleted,
+unset_deleted(!Line, [TagDelta]) :-
+    remove_tag(tag("deleted"), !Line),
     TagDelta = tag_delta("-deleted").
+
+:- pred add_tag(tag::in, index_line::in, index_line::out) is det.
+
+add_tag(Tag, !Line) :-
+    TagSet0 = !.Line ^ i_tags,
+    set.insert(Tag, TagSet0, TagSet),
+    set_tags(TagSet, !Line).
+
+:- pred remove_tag(tag::in, index_line::in, index_line::out) is det.
+
+remove_tag(Tag, !Line) :-
+    TagSet0 = !.Line ^ i_tags,
+    ( set.remove(Tag, TagSet0, TagSet) ->
+        set_tags(TagSet, !Line)
+    ;
+        true
+    ).
+
+:- pred set_tags(set(tag)::in, index_line::in, index_line::out) is det.
+
+set_tags(TagSet, !Line) :-
+    get_standard_tags(TagSet, StdTags, NonstdTagsWidth),
+    !Line ^ i_tags := TagSet,
+    !Line ^ i_std_tags := StdTags,
+    !Line ^ i_nonstd_tags_width := NonstdTagsWidth.
 
 %-----------------------------------------------------------------------------%
 
@@ -1189,17 +1211,15 @@ prompt_arbitrary_tag_changes(Screen, Initial, Completion, TagChanges,
     io::di, io::uo) is det.
 
 apply_tag_changes(CursorLine0, TagDeltas, AddTags, RemoveTags, !Info, !IO) :-
-    CursorLine0 = index_line(ThreadId, Selected, Date, Authors, Subject,
-        TagSet0, StdTags0, _NonstdTagsWidth, Matched, Total),
-    apply_standard_tag_state(StdTags0, TagSet0, TagSet1),
     Config = !.Info ^ i_config,
+    ThreadId = CursorLine0 ^ i_id,
     async_tag_threads(Config, TagDeltas, [ThreadId], !IO),
     % Notmuch performs tag removals before addition.
-    set.difference(TagSet1, RemoveTags, TagSet2),
-    set.union(TagSet2, AddTags, TagSet),
-    get_standard_tags(TagSet, StdTags, NonstdTagsWidth),
-    CursorLine = index_line(ThreadId, Selected, Date, Authors, Subject,
-        TagSet, StdTags, NonstdTagsWidth, Matched, Total),
+    TagSet0 = CursorLine0 ^ i_tags,
+    set.difference(TagSet0, RemoveTags, TagSet1),
+    set.union(TagSet1, AddTags, TagSet),
+    set_tags(TagSet, CursorLine0, CursorLine),
+
     Scrollable0 = !.Info ^ i_scrollable,
     set_cursor_line(CursorLine, Scrollable0, Scrollable),
     !Info ^ i_scrollable := Scrollable.
@@ -1341,9 +1361,7 @@ gather_bulk_initial_tags(Line, MaybeAndTagSet0, MaybeAndTagSet, !OrTagSet) :-
     set(tag)::in, set(tag)::out) is det.
 
 gather_initial_tags(Line, MaybeAndTagSet0, AndTagSet, !OrTagSet) :-
-    Line = index_line(_ThreadId, _Selected, _Date, _Authors, _Subject,
-        TagSet0, StdTags, _NonstdTagsWidth, _Matched, _Total),
-    apply_standard_tag_state(StdTags, TagSet0, TagSet),
+    TagSet = Line ^ i_tags,
     (
         MaybeAndTagSet0 = no,
         AndTagSet = TagSet
@@ -1401,19 +1419,17 @@ bulk_tag_changes(TagDeltas, AddTags, RemoveTags, MessageUpdate, !Info, !IO) :-
 
 update_selected_line_for_tag_changes(AddTags, RemoveTags, Line0, Line,
         !ThreadIds) :-
-    Line0 = index_line(ThreadId, Selected, Date, Authors, Subject,
-        TagSet0, _StdTags0, _NonstdTagsWidth0, Matched, Total),
+    ThreadId = Line0 ^ i_id,
+    TagSet0 = Line0 ^ i_tags,
+    Selected = Line0 ^ i_selected,
     (
         Selected = selected,
         % Notmuch performs tag removals before addition.
-        TagSet0 = Line0 ^ i_tags,
         set.difference(TagSet0, RemoveTags, TagSet1),
         set.union(TagSet1, AddTags, TagSet),
         TagSet \= TagSet0
     ->
-        get_standard_tags(TagSet, StdTags, NonstdTagsWidth),
-        Line = index_line(ThreadId, Selected, Date, Authors, Subject, TagSet,
-            StdTags, NonstdTagsWidth, Matched, Total),
+        set_tags(TagSet, Line0, Line),
         list.cons(ThreadId, !ThreadIds)
     ;
         Line = Line0
@@ -1581,9 +1597,10 @@ line_matches_thread_id(ThreadId, Line) :-
 refresh_index_line(Screen, ThreadId, !IndexInfo, !IO) :-
     Config = !.IndexInfo ^ i_config,
     Term = thread_id_to_search_term(ThreadId),
-    run_notmuch(Config, [
-        "search", "--format=json", "--exclude=all", "--", Term
-    ], parse_threads_list, Result, !IO),
+    run_notmuch(Config,
+        ["search", "--format=json", "--exclude=all", "--", Term],
+        no_suspend_curses,
+        parse_threads_list, Result, !IO),
     (
         Result = ok([Thread]),
         current_timestamp(Time, !IO),
@@ -1664,15 +1681,22 @@ sched_poll(Time, !Info, !IO) :-
     get_notmuch_command(Config, Notmuch),
     Tokens = !.Info ^ i_search_tokens,
     SearchTime = !.Info ^ i_search_time,
-    tokens_to_search_terms(Tokens, Terms1, _ApplyCap, !IO),
-    Args = [
-        "count", "--",
-        "(", Terms1, ")", timestamp_to_int_string(SearchTime) ++ "..",
-        "AND", "tag:unread"
-    ],
-    Op = async_lowprio_command(Notmuch, Args),
+    index_poll_terms(Tokens, IndexPollTerms, !IO),
+    % Could use notmuch count --batch
+    Args =
+        ["count", "--"] ++
+        IndexPollTerms ++
+        ["AND", timestamp_to_int_string(SearchTime) ++ ".."],
+    Op = async_lowprio_command(Notmuch, Args, no),
     push_lowprio_async(Op, _Pushed, !IO),
     !Info ^ i_next_poll_time := next_poll_time(Config, Time).
+
+:- pred index_poll_terms(list(token), list(string), io, io).
+:- mode index_poll_terms(in, out, di, uo) is det.
+
+index_poll_terms(Tokens, IndexPollTerms, !IO) :-
+    tokens_to_search_terms(Tokens, SearchTerms, _ApplyCap, !IO),
+    IndexPollTerms = ["(", SearchTerms, ")", "AND", "tag:unread"].
 
 :- pred handle_poll_result(screen::in, string::in,
     index_info::in, index_info::out, io::di, io::uo) is det.
@@ -1699,39 +1723,8 @@ handle_poll_result(Screen, CountOutput, !Info, !IO) :-
             )
         )
     ;
-        update_message(Screen,
-            set_warning("notmuch count return unexpected result"), !IO)
-    ).
-
-:- pred maybe_poll_notify(prog_config::in, string::in, message_update::out,
-    io::di, io::uo) is det.
-
-maybe_poll_notify(Config, Message, MessageUpdate, !IO) :-
-    get_poll_notify_command(Config, MaybeCommandPrefix),
-    (
-        MaybeCommandPrefix = yes(CommandPrefix),
-        make_quoted_command(CommandPrefix, [Message],
-            redirect_input("/dev/null"), redirect_output("/dev/null"),
-            Command),
-        io.call_system(Command, CallRes, !IO),
-        (
-            CallRes = ok(ExitStatus),
-            ( ExitStatus = 0 ->
-                MessageUpdate = no_change
-            ;
-                string.format("poll_notify command returned exit status %d",
-                    [i(ExitStatus)], Warning),
-                MessageUpdate = set_warning(Warning)
-            )
-        ;
-            CallRes = error(Error),
-            Warning = "Error running poll_notify command: " ++
-                io.error_message(Error),
-            MessageUpdate = set_warning(Warning)
-        )
-    ;
-        MaybeCommandPrefix = no,
-        MessageUpdate = no_change
+        update_message_immed(Screen,
+            set_warning("notmuch count returned unexpected result"), !IO)
     ).
 
 :- func next_poll_time(prog_config, timestamp) = maybe(timestamp).
@@ -1745,118 +1738,6 @@ next_poll_time(Config, Time) = NextPollTime :-
         Maybe = no,
         NextPollTime = no
     ).
-
-%-----------------------------------------------------------------------------%
-
-:- pred poll_async_with_progress(screen::in, index_info::in, index_info::out,
-    io::di, io::uo) is det.
-
-poll_async_with_progress(Screen, !Info, !IO) :-
-    poll_async_nonblocking(Return, !IO),
-    (
-        Return = none
-    ;
-        Return = child_succeeded,
-        poll_async_with_progress(Screen, !Info, !IO)
-    ;
-        Return = child_lowprio_output(Output),
-        handle_poll_result(Screen, Output, !Info, !IO),
-        poll_async_with_progress(Screen, !Info, !IO)
-    ;
-        Return = child_failed(Op, Failure),
-        handle_async_failure(Screen, Op, Failure, !IO),
-        poll_async_with_progress(Screen, !Info, !IO)
-    ).
-
-:- pred flush_async_with_progress(screen::in, io::di, io::uo) is det.
-
-flush_async_with_progress(Screen, !IO) :-
-    clear_lowprio_async(!IO),
-    async_count(Count, !IO),
-    ( Count = 0 ->
-        true
-    ;
-        flush_async_with_progress_loop(Screen, yes, !IO)
-    ).
-
-:- pred flush_async_with_progress_loop(screen::in, bool::in, io::di, io::uo)
-    is det.
-
-flush_async_with_progress_loop(Screen, Display, !IO) :-
-    async_count(Count, !IO),
-    ( Count = 0 ->
-        update_message(Screen, clear_message, !IO)
-    ;
-        (
-            Display = yes,
-            string.format("Flushing %d asynchronous operations.",
-                [i(Count)], Message),
-            update_message_immed(Screen, set_info(Message), !IO)
-        ;
-            Display = no
-        ),
-        poll_async_blocking(Return, !IO),
-        (
-            Return = none,
-            % Don't busy wait.
-            usleep(100000, !IO),
-            flush_async_with_progress_loop(Screen, no, !IO)
-        ;
-            Return = child_succeeded,
-            flush_async_with_progress_loop(Screen, yes, !IO)
-        ;
-            Return = child_lowprio_output(_),
-            flush_async_with_progress_loop(Screen, yes, !IO)
-        ;
-            Return = child_failed(Op, Failure),
-            handle_async_failure(Screen, Op, Failure, !IO),
-            flush_async_with_progress_loop(Screen, no, !IO)
-        )
-    ).
-
-:- pred handle_async_failure(screen::in, async_op::in, async_failure::in,
-    io::di, io::uo) is det.
-
-handle_async_failure(Screen, Op, Failure, !IO) :-
-    Op = async_shell_command(Prefix, Args, RemainingAttempts0),
-    Prefix = command_prefix(shell_quoted(PrefixString), _),
-    FullCommand = string.join_list(" ", [PrefixString | Args]),
-    ( string.count_codepoints(FullCommand) > 40 ->
-        ShortCommand = "..." ++ string.right(FullCommand, 37)
-    ;
-        ShortCommand = FullCommand
-    ),
-    (
-        Failure = failure_nonzero_exit(Status),
-        ( RemainingAttempts0 = 0 ->
-            string.format("'%s' returned exit status %d; not retrying.",
-                [s(ShortCommand), i(Status)], Message)
-        ;
-            Delay = 5,
-            string.format("'%s' returned exit status %d; retrying in %d secs.",
-                [s(ShortCommand), i(Status), i(Delay)], Message),
-            RemainingAttempts = RemainingAttempts0 - 1,
-            RetryOp = async_shell_command(Prefix, Args, RemainingAttempts),
-            retry_async(Delay, RetryOp, !IO)
-        )
-    ;
-        Failure = failure_signal(Signal),
-        string.format("'%s' received signal %d; not retrying.",
-            [s(ShortCommand), i(Signal)], Message)
-    ;
-        Failure = failure_abnormal_exit,
-        string.format("'%s' exited abnormally; not retrying.",
-            [s(ShortCommand)], Message)
-    ;
-        Failure = failure_error(Error),
-        string.format("'%s': %s; not retrying.",
-            [s(ShortCommand), s(io.error_message(Error))], Message)
-    ),
-    update_message_immed(Screen, set_warning(Message), !IO),
-    sleep(1, !IO).
-handle_async_failure(_Screen, Op, _Failure, !IO) :-
-    % Ignore poll command failures.
-    Op = async_lowprio_command(_, _).
 
 %-----------------------------------------------------------------------------%
 
@@ -1974,10 +1855,11 @@ draw_display_tag(Panel, Tag, !IO) :-
 draw_index_bar(Screen, Info, !IO) :-
     Count = Info ^ i_poll_count,
     ( Count = 0 ->
-        draw_status_bar(Screen, !IO)
+        MaybeText = no
     ;
-        draw_status_bar(Screen, count_messages_since_refresh(Count), !IO)
-    ).
+        MaybeText = yes(count_messages_since_refresh(Count))
+    ),
+    draw_status_bar(Screen, MaybeText, no, !IO).
 
 :- func count_messages_since_refresh(int) = string.
 
