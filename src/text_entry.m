@@ -22,9 +22,7 @@
     ;       complete_limit(
                 prog_config,
                 % Name of search alias section.
-                string,
-                % Prefixes to trigger tag completion.
-                list(string)
+                string
             )
     ;       complete_tags_smart(
                 prog_config,
@@ -77,6 +75,7 @@
 :- import_module curs.
 :- import_module curs.panel.
 :- import_module list_util.
+:- import_module notmuch_config.
 :- import_module quote_arg.
 :- import_module string_util.
 
@@ -88,8 +87,9 @@
                 first_time      :: bool,
                 left_offset     :: int,
                 compl_type      :: completion_type, % static
-                compl_choices   :: list(string),
-                compl_point     :: int
+                compl_state     :: maybe(completion_state),
+                compl_point     :: int,
+                config_cache    :: maybe(notmuch_config)
             ).
 
     % This is a stack implemented as a reverse list.  The stack module
@@ -104,6 +104,17 @@
                 pre_history     :: history,
                 post_history    :: history
             ).
+
+:- type completion_state
+    --->    completion_state(
+                compl_back      :: list(string), % reverse
+                compl_curr      :: maybe(string),
+                compl_forward   :: list(string)
+            ).
+
+:- type cycle_dir
+    --->    forward
+    ;       back.
 
 :- type history == list(string). % reverse
 
@@ -158,7 +169,7 @@ text_entry_full(Screen, Prompt, History, Initial, CompleteType, FirstTime,
     States = [],
     LeftOffset = 0,
     Info0 = info(Prompt, State, States, FirstTime, LeftOffset, CompleteType,
-        [], 0),
+        no, 0, no),
     text_entry_loop(Screen, Return, Info0, _Info, !IO),
     update_message(Screen, clear_message, !IO).
 
@@ -279,44 +290,45 @@ text_entry_loop(Screen, Return, !Info, !IO) :-
         move_history(post, !Info),
         continue_text_entry(Screen, Return, !Info, !IO)
     ;
-        Key = char('\x09\') % Tab
+        (
+            Key = char('\x09\'), % Tab
+            CycleDir = forward
+        ;
+            Key = code(key_btab), % Shift-Tab
+            CycleDir = back
+        )
     ->
         !.Info ^ compl_type = Type,
         !.Info ^ state = State0,
         State0 = te_state(Before0, After0, Pre, Post),
         forward_for_completion(Type, Before0, Before1, After0, After),
-        do_completion(Before1, Before, After, !.Info, MaybeInfo, !IO),
+        do_completion(CycleDir, Before1, MaybeBefore, After, !Info, !IO),
         (
-            MaybeInfo = yes(!:Info),
+            MaybeBefore = yes(Before),
             State = te_state(Before, After, Pre, Post),
             enter_state(State, yes, !Info),
-            clear_first_time_flag(!Info),
-            text_entry_loop(Screen, Return, !Info, !IO)
+            special_clear_path_completion_choices(!Info)
         ;
-            MaybeInfo = no,
-            % XXX type tab?
-            continue_text_entry(Screen, Return, !Info, !IO)
-        )
+            MaybeBefore = no
+        ),
+        % Don't clear completion choices.
+        clear_first_time_flag(!Info),
+        text_entry_loop(Screen, Return, !Info, !IO)
     ;
         Key = char('\x1f\') % ^_
     ->
         undo(!Info),
         continue_text_entry(Screen, Return, !Info, !IO)
     ;
-        (
-            Key = char(Char),
-            isprint(Char)
-        ->
-            insert(Char, !Info),
-            continue_text_entry(Screen, Return, !Info, !IO)
-        ;
-            Key = timeout_or_error
-        ->
-            % Don't clear first time flag on a timeout.
-            text_entry_loop(Screen, Return, !Info, !IO)
-        ;
-            continue_text_entry(Screen, Return, !Info, !IO)
-        )
+        Key = char(Char),
+        isprint(Char)
+    ->
+        insert(Char, !Info),
+        continue_text_entry(Screen, Return, !Info, !IO)
+    ;
+        % Don't clear first time flag or completion choices
+        % if no character entered.
+        text_entry_loop(Screen, Return, !Info, !IO)
     ).
 
 :- pred continue_text_entry(screen::in, maybe(string)::out,
@@ -341,9 +353,27 @@ clear_first_time_flag(!Info) :-
 :- pred clear_completion_choices(info::in, info::out) is det.
 
 clear_completion_choices(!Info) :-
-    ( !.Info ^ compl_choices = [_ | _] ->
-        !Info ^ compl_choices := [],
+    (
+        !.Info ^ compl_state = yes(_),
+        !Info ^ compl_state := no,
         !Info ^ compl_point := 0
+    ;
+        !.Info ^ compl_state = no
+    ).
+
+:- pred special_clear_path_completion_choices(info::in, info::out) is det.
+
+special_clear_path_completion_choices(!Info) :-
+    % Special case for paths: if we completed a directory name and it was the
+    % only available choice, then reset the completion state as if the user
+    % typed the directory name manually. Then the user can immediately press
+    % Tab to complete the names of files within that directory.
+    (
+        !.Info ^ compl_type = complete_path(_),
+        !.Info ^ compl_state = yes(completion_state([], yes(Curr), [])),
+        string.suffix(Curr, "/")
+    ->
+        clear_completion_choices(!Info)
     ;
         true
     ).
@@ -569,7 +599,7 @@ forward_for_completion(Type, Before0, Before, After0, After) :-
         Before = reverse(After0) ++ Before0,
         After = []
     ;
-        ( Type = complete_limit(_, _, _)
+        ( Type = complete_limit(_, _)
         ; Type = complete_tags_smart(_, _, _)
         ; Type = complete_config_key(_, _)
         ),
@@ -581,41 +611,39 @@ forward_for_completion(Type, Before0, Before, After0, After) :-
         Before = list.reverse(Take) ++ Before0
     ).
 
-:- pred do_completion(list(char)::in, list(char)::out, list(char)::in,
-    info::in, maybe(info)::out, io::di, io::uo) is det.
+:- pred do_completion(cycle_dir::in, list(char)::in, maybe(list(char))::out,
+    list(char)::in, info::in, info::out, io::di, io::uo) is det.
 
-do_completion(Orig, Replacement, After, Info0, MaybeInfo, !IO) :-
-    Choices0 = Info0 ^ compl_choices,
+do_completion(CycleDir, Orig, MaybeReplacement, After, !Info, !IO) :-
     (
-        Choices0 = [],
-        Type = Info0 ^ compl_type,
-        generate_choices(Type, Orig, After, Choices, CompletionPoint,
-            !IO),
+        !.Info ^ compl_state = no,
+        Type = !.Info ^ compl_type,
+        generate_choices(Type, Orig, After, NewChoices, NewCompletionPoint,
+            !Info, !IO),
+        !Info ^ compl_state := yes(completion_state([], no, NewChoices)),
+        !Info ^ compl_point := NewCompletionPoint,
         IsNew = yes
     ;
-        Choices0 = [_ | _],
-        Choices = Choices0,
-        CompletionPoint = Info0 ^ compl_point,
+        !.Info ^ compl_state = yes(_),
         IsNew = no
     ),
     (
-        Choices = [],
-        Replacement = Orig,
-        MaybeInfo = no
-    ;
-        Choices = [_ | _],
-        choose_expansion(IsNew, Choices, Expansion, RotateChoices),
-        det_take_tail(CompletionPoint, Orig, OrigKeep),
+        !.Info ^ compl_state = yes(CompletionState0),
+        choose_expansion(CycleDir, IsNew, Orig, Expansion,
+            CompletionState0, CompletionState)
+    ->
+        !Info ^ compl_state := yes(CompletionState),
+        det_take_tail(!.Info ^ compl_point, Orig, OrigKeep),
         reverse_onto(Expansion, OrigKeep, Replacement),
-        Info1 = Info0 ^ compl_choices := RotateChoices,
-        Info = Info1 ^ compl_point := CompletionPoint,
-        MaybeInfo = yes(Info)
+        MaybeReplacement = yes(Replacement)
+    ;
+        MaybeReplacement = no
     ).
 
 :- pred generate_choices(completion_type::in, list(char)::in, list(char)::in,
-    list(string)::out, int::out, io::di, io::uo) is det.
+    list(string)::out, int::out, info::in, info::out, io::di, io::uo) is det.
 
-generate_choices(Type, Orig, After, Choices, CompletionPoint, !IO) :-
+generate_choices(Type, Orig, After, Choices, CompletionPoint, !Info, !IO) :-
     (
         Type = complete_none,
         Choices = [],
@@ -626,13 +654,12 @@ generate_choices(Type, Orig, After, Choices, CompletionPoint, !IO) :-
         generate_path_choices(Home, OrigString, Choices, !IO),
         CompletionPoint = 0
     ;
-        Type = complete_limit(Config, SearchAliasSection,
-            TagCompletionTriggers),
+        Type = complete_limit(Config, SearchAliasSection),
         list_util.take_while(non_whitespace, Orig, Word, Untouched),
         list.length(Untouched, CompletionPoint),
         string.from_rev_char_list(Word, WordString),
-        generate_limit_choices(Config, SearchAliasSection,
-            TagCompletionTriggers, WordString, Choices, !IO)
+        generate_limit_choices(Config, SearchAliasSection, WordString, Choices,
+            !Info, !IO)
     ;
         Type = complete_tags_smart(Config, AndTags, OrTags),
         list_util.take_while(non_whitespace, Orig, Word, Untouched),
@@ -646,47 +673,71 @@ generate_choices(Type, Orig, After, Choices, CompletionPoint, !IO) :-
         list_util.take_while(non_whitespace, Orig, Word, Untouched),
         list.length(Untouched, CompletionPoint),
         string.from_rev_char_list(Word, WordString),
-        generate_config_key_choices(Config, SectionName, WordString, Choices,
-            !IO)
+        generate_config_key_choices(Config, [SectionName], WordString, Choices,
+            !Info, !IO)
     ;
         Type = complete_address(Config),
         list_util.take_while(not_comma, Orig, RevWord0, Prefix),
         list_util.take_while(is_whitespace, reverse(RevWord0), LeadWhiteSpace, Word),
         CompletionPoint = length(Prefix) + length(LeadWhiteSpace),
         WordString = rstrip(from_char_list(Word)),
-        generate_config_key_choices(Config, addressbook_section,
-            WordString, AliasChoices, !IO),
+        generate_config_key_choices(Config, [addressbook_section], WordString,
+            AliasChoices, !Info, !IO),
         ( WordString = "" ->
             Choices = AliasChoices
         ;
-            generate_address_choices(Config, WordString, AddressChoices, !IO),
+            generate_address_choices(Config, WordString, AddressChoices,
+                !Info, !IO),
             Choices = AliasChoices ++ AddressChoices
         )
     ).
 
-:- pred choose_expansion(bool::in, list(string)::in(non_empty_list),
-    list(char)::out, list(string)::out) is det.
+:- pred choose_expansion(cycle_dir::in, bool::in, list(char)::in,
+    list(char)::out, completion_state::in, completion_state::out) is semidet.
 
-choose_expansion(IsNew, Choices, Expansion, RotateChoices) :-
+choose_expansion(CycleDir, IsNew, Orig, Expansion,
+        CompletionState0, CompletionState) :-
+    CompletionState0 = completion_state(Back0, Curr0, Forward0),
     (
-        Choices = [Choice],
-        Expansion = to_char_list(Choice),
-        RotateChoices = []
+        CycleDir = forward,
+        cyclic_next(push(Curr0, Back0), Forward0, Back, Curr, Forward)
     ;
-        Choices = [FirstChoice | MoreChoices],
-        MoreChoices = [_ | _],
-        string.to_char_list(FirstChoice, FirstChoiceChars),
-        (
-            IsNew = yes,
-            common_prefix_strings(MoreChoices, FirstChoiceChars, CommonPrefix),
-            CommonPrefix \= FirstChoiceChars
-        ->
-            Expansion = CommonPrefix,
-            RotateChoices = Choices
-        ;
-            Expansion = FirstChoiceChars,
-            RotateChoices = MoreChoices ++ [FirstChoice]
-        )
+        CycleDir = back,
+        cyclic_next(push(Curr0, Forward0), Back0, Forward, Curr, Back)
+    ),
+    CurrChars = to_char_list(Curr),
+    (
+        IsNew = yes,
+        Curr0 = no,
+        common_prefix_strings(Back ++ Forward, CurrChars, CommonPrefix),
+        CommonPrefix \= CurrChars,
+        % Don't bother with the common prefix if that is the string being
+        % completed anyway.
+        CommonPrefix \= reverse(Orig)
+    ->
+        Expansion = CommonPrefix,
+        CompletionState = CompletionState0
+    ;
+        Expansion = CurrChars,
+        CompletionState = completion_state(Back, yes(Curr), Forward)
+    ).
+
+:- func push(maybe(T), list(T)) = list(T).
+
+push(no, Xs) = Xs.
+push(yes(X), Xs) = [X | Xs].
+
+:- pred cyclic_next(list(T)::in, list(T)::in,
+    list(T)::out, T::out, list(T)::out) is semidet.
+
+cyclic_next(Back0, Forward0, Back, Curr, Forward) :-
+    (
+        Forward0 = [],
+        Back = [],
+        reverse(Back0, [Curr | Forward])
+    ;
+        Forward0 = [Curr | Forward],
+        Back = Back0
     ).
 
 %-----------------------------------------------------------------------------%
@@ -782,27 +833,23 @@ is_directory(DirName, BaseName, FileType0, IsDir, !IO) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred generate_limit_choices(prog_config::in, string::in, list(string)::in,
-    string::in, list(string)::out, io::di, io::uo) is det.
+:- pred generate_limit_choices(prog_config::in, string::in, string::in,
+    list(string)::out, info::in, info::out, io::di, io::uo) is det.
 
-generate_limit_choices(Config, SearchAliasSection, TagCompletionTriggers,
-        OrigString, Choices, !IO) :-
-    ( string.remove_prefix("~", OrigString, KeyPrefix) ->
-        generate_search_alias_choices(Config, SearchAliasSection, KeyPrefix,
-            Choices, !IO)
+generate_limit_choices(Config, SearchAliasSection, OrigString, Choices,
+        !Info, !IO) :-
+    ( string.remove_prefix("~", OrigString, NamePrefix) ->
+        generate_config_key_choices(Config, [SearchAliasSection, "query"],
+            NamePrefix, Choices0, !Info, !IO),
+        list.map(append("~"), Choices0) = Choices
+    ; string.remove_prefix("query:", OrigString, NamePrefix) ->
+        generate_config_key_choices(Config, ["query"], NamePrefix,
+            Choices0, !Info, !IO),
+        list.map(append("query:"), Choices0) = Choices
     ;
-        generate_tag_choices(Config, TagCompletionTriggers, OrigString,
-            Choices, !IO)
+        Triggers = ["tag:", "+tag:", "-tag:", "is:", "+is:", "-is:"],
+        generate_tag_choices(Config, Triggers, OrigString, Choices, !IO)
     ).
-
-:- pred generate_search_alias_choices(prog_config::in, string::in, string::in,
-    list(string)::out, io::di, io::uo) is det.
-
-generate_search_alias_choices(Config, SearchAliasSection, KeyPrefix, Choices,
-        !IO) :-
-    generate_config_key_choices(Config, SearchAliasSection, KeyPrefix,
-        Choices0, !IO),
-    list.map(append("~"), Choices0) = Choices.
 
 %-----------------------------------------------------------------------------%
 
@@ -810,14 +857,14 @@ generate_search_alias_choices(Config, SearchAliasSection, KeyPrefix, Choices,
     list(string)::out, io::di, io::uo) is det.
 
 generate_tag_choices(_Config, [], _OrigString, [], !IO).
-generate_tag_choices(Config, CompletionTriggers, OrigString, Choices, !IO) :-
-    CompletionTriggers = [Trigger | Triggers],
+generate_tag_choices(Config, Triggers, OrigString, Choices, !IO) :-
+    Triggers = [Trigger | TriggersTail],
     ( string.remove_prefix(Trigger, OrigString, TagPrefix) ->
         get_notmuch_all_tags(Config, TagsList, !IO),
         list.filter_map(filter_tag_choice(Trigger, TagPrefix),
             TagsList, Choices)
     ;
-        generate_tag_choices(Config, Triggers, OrigString, Choices, !IO)
+        generate_tag_choices(Config, TriggersTail, OrigString, Choices, !IO)
     ).
 
 :- pred get_entered_tags(list(char)::in, list(char)::in, set(string)::out)
@@ -867,6 +914,7 @@ generate_smart_tag_choices(Config, AndTagSet, OrTagSet, EnteredTagSet,
         Choices = []
     ).
 
+    % XXX Could cache tags list.
 :- pred get_notmuch_all_tags(prog_config::in, list(string)::out,
     io::di, io::uo) is det.
 
@@ -894,61 +942,47 @@ filter_tag_choice(Trigger, TagPrefix, Tag, Choice) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred generate_config_key_choices(prog_config::in, string::in, string::in,
-    list(string)::out, io::di, io::uo) is det.
+:- pred generate_config_key_choices(prog_config::in, list(string)::in,
+    string::in, list(string)::out, info::in, info::out, io::di, io::uo) is det.
 
-generate_config_key_choices(Config, SectionName, OrigString, Choices, !IO) :-
-    get_notmuch_command(Config, Notmuch),
-    make_quoted_command(Notmuch, ["config", "list"],
-        redirect_input("/dev/null"), no_redirect, Command),
-    call_system_capture_stdout(Command, no, CallRes, !IO),
-    (
-        CallRes = ok(ItemsString),
-        % The empty string following the final newline is not an item.
-        ItemsList = string.words_separator(unify('\n'), ItemsString),
-        list.filter_map(
-            filter_config_key_choice(SectionName ++ ".", OrigString),
-            ItemsList, Choices0),
-        list.sort(Choices0, Choices)
-    ;
-        CallRes = error(_),
-        Choices = []
-    ).
-
-:- pred filter_config_key_choice(string::in, string::in, string::in,
-    string::out) is semidet.
-
-filter_config_key_choice(SectionNameDot, OrigString, Input, Key) :-
-    string.remove_prefix(SectionNameDot, Input, InputSansSection),
-    string.prefix(InputSansSection, OrigString),
-    KeyStart = 0,
-    find_first_char(InputSansSection, '=', KeyStart, KeyEnd),
-    KeyEnd > KeyStart,
-    string.between(InputSansSection, KeyStart, KeyEnd, Key).
-
-:- pred find_first_char(string::in, char::in, int::in, int::out) is semidet.
-
-find_first_char(S, FindChar, I0, I) :-
-    string.unsafe_index_next(S, I0, I1, C),
-    ( C = FindChar ->
-        I = I0
-    ;
-        find_first_char(S, FindChar, I1, I)
-    ).
+generate_config_key_choices(Config, SectionNames, ItemNamePrefix, Choices,
+        !Info, !IO) :-
+    get_notmuch_config_cached(Config, NotmuchConfig, !Info, !IO),
+    get_item_names_with_prefix(NotmuchConfig, SectionNames, ItemNamePrefix,
+        Choices).
 
 %-----------------------------------------------------------------------------%
 
 :- pred generate_address_choices(prog_config::in, string::in,
-    list(string)::out, io::di, io::uo) is det.
+    list(string)::out, info::in, info::out, io::di, io::uo) is det.
 
-generate_address_choices(Config, OrigString, Choices, !IO) :-
-    search_addressbook(Config, OrigString, MaybeFound, !IO),
-    (
-        MaybeFound = yes(Choice),
+generate_address_choices(Config, OrigString, Choices, !Info, !IO) :-
+    get_notmuch_config_cached(Config, NotmuchConfig, !Info, !IO),
+    ( search_addressbook(NotmuchConfig, OrigString, Choice) ->
         Choices = [Choice]
     ;
-        MaybeFound = no,
         search_notmuch_address(Config, OrigString, Choices, !IO)
+    ).
+
+%-----------------------------------------------------------------------------%
+
+:- pred get_notmuch_config_cached(prog_config::in, notmuch_config::out,
+    info::in, info::out, io::di, io::uo) is det.
+
+get_notmuch_config_cached(Config, NotmuchConfig, !Info, !IO) :-
+    Cache0 = !.Info ^ config_cache,
+    (
+        Cache0 = yes(NotmuchConfig)
+    ;
+        Cache0 = no,
+        get_notmuch_config(Config, ResConfig, !IO),
+        (
+            ResConfig = ok(NotmuchConfig)
+        ;
+            ResConfig = error(_Error),
+            NotmuchConfig = empty_notmuch_config
+        ),
+        !Info ^ config_cache := yes(NotmuchConfig)
     ).
 
 %-----------------------------------------------------------------------------%

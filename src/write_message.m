@@ -45,15 +45,16 @@
 :- type mime_part
     --->    discrete(
                 discrete_content_type,
-                maybe(content_disposition),
-                maybe(content_transfer_encoding),
+                % maybe(content_charset)?
+                maybe(write_content_disposition),
+                maybe(write_content_transfer_encoding),
                 mime_part_body
             )
     ;       composite(
                 composite_content_type,
                 boundary,
-                maybe(content_disposition),
-                maybe(content_transfer_encoding),
+                maybe(write_content_disposition),
+                maybe(write_content_transfer_encoding),
                 list(mime_part)
             ).
 
@@ -85,14 +86,17 @@
 :- type micalg
     --->    micalg(string). % pgp-*
 
-:- type content_disposition
+:- type write_content_disposition
+    --->    write_content_disposition(
+                write_content_disposition_type,
+                maybe(filename)
+            ).
+
+:- type write_content_disposition_type
     --->    inline
-    ;       attachment(maybe(filename)).
+    ;       attachment.
 
-:- type filename
-    --->    filename(string).
-
-:- type content_transfer_encoding
+:- type write_content_transfer_encoding
     --->    cte_8bit
     ;       cte_base64.
 
@@ -375,38 +379,40 @@ write_composite_content_type(Stream, ContentType, boundary(Boundary), !IO) :-
 protocol_string(application_pgp_encrypted) = "application/pgp-encrypted".
 protocol_string(application_pgp_signature) = "application/pgp-signature".
 
-:- pred write_content_disposition(Stream::in, content_disposition::in,
+:- pred write_content_disposition(Stream::in, write_content_disposition::in,
     io::di, io::uo) is det <= writer(Stream).
 
 write_content_disposition(Stream, Disposition, !IO) :-
+    Disposition = write_content_disposition(DispositionType, MaybeFileName),
     (
-        Disposition = inline,
-        put(Stream, "Content-Disposition: inline\n", !IO)
+        DispositionType = inline,
+        put(Stream, "Content-Disposition: inline", !IO)
     ;
-        Disposition = attachment(MaybeFileName),
-        put(Stream, "Content-Disposition: attachment", !IO),
+        DispositionType = attachment,
+        put(Stream, "Content-Disposition: attachment", !IO)
+    ),
+    (
+        MaybeFileName = yes(filename(FileName)),
+        Attr = attribute("filename"),
+        Value = quoted_string(make_quoted_string(FileName)),
+        rfc2231.encode_parameter(Attr - Value, Param),
+        parameter_to_string(Param, ParamString, Valid),
         (
-            MaybeFileName = yes(filename(FileName)),
-            Attr = attribute("filename"),
-            Value = quoted_string(make_quoted_string(FileName)),
-            rfc2231.encode_parameter(Attr - Value, Param),
-            parameter_to_string(Param, ParamString, Valid),
-            (
-                Valid = yes,
-                put(Stream, "; ", !IO),
-                put(Stream, ParamString, !IO)
-            ;
-                Valid = no
-                % Shouldn't happen.
-            )
+            Valid = yes,
+            put(Stream, "; ", !IO),
+            put(Stream, ParamString, !IO)
         ;
-            MaybeFileName = no
-        ),
-        put(Stream, "\n", !IO)
-    ).
+            Valid = no
+            % Shouldn't happen.
+        )
+    ;
+        MaybeFileName = no
+    ),
+    put(Stream, "\n", !IO).
 
 :- pred write_content_transfer_encoding(Stream::in,
-    content_transfer_encoding::in, io::di, io::uo) is det <= writer(Stream).
+    write_content_transfer_encoding::in, io::di, io::uo) is det
+    <= writer(Stream).
 
 write_content_transfer_encoding(Stream, CTE, !IO) :-
     (
@@ -442,8 +448,8 @@ write_mime_final_boundary(Stream, boundary(Boundary), !IO) :-
     put(Stream, "--\n", !IO).
 
 :- pred write_mime_part_body(Stream::in, prog_config::in,
-    content_transfer_encoding::in, mime_part_body::in, i_paused_curses::in,
-    io::di, io::uo) is det <= writer(Stream).
+    write_content_transfer_encoding::in, mime_part_body::in,
+    i_paused_curses::in, io::di, io::uo) is det <= writer(Stream).
 
 write_mime_part_body(Stream, Config, TransferEncoding, Body, PausedCurs,
         !IO) :-
@@ -480,7 +486,7 @@ write_mime_part_body(Stream, Config, TransferEncoding, Body, PausedCurs,
     i_paused_curses::in, io::di, io::uo) is det.
 
 get_external_part_base64(Config, Part, Content, PausedCurs, !IO) :-
-    Part = part(MessageId, MaybePartId, _, _, _, _, _, IsDecrypted),
+    Part = part(MessageId, MaybePartId, _, _, _, _, _, _, IsDecrypted),
     (
         MaybePartId = yes(PartId),
         get_notmuch_command(Config, Notmuch),
@@ -505,10 +511,10 @@ get_external_part_base64(Config, Part, Content, PausedCurs, !IO) :-
         unexpected($module, $pred, io.error_message(Error))
     ).
 
-:- func decrypt_arg(bool) = string.
+:- func decrypt_arg(maybe_decrypted) = string.
 
-decrypt_arg(yes) = "--decrypt".
-decrypt_arg(no) = "--decrypt=false".
+decrypt_arg(is_decrypted) = "--decrypt".
+decrypt_arg(not_decrypted) = "--decrypt=false".
 
 %-----------------------------------------------------------------------------%
 % vim: ft=mercury ts=4 sts=4 sw=4 et

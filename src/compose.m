@@ -36,12 +36,16 @@
     message_id::in, reply_kind::in, screen_transition(sent)::out,
     io::di, io::uo) is det.
 
+:- pred start_forward(prog_config::in, crypto::in, screen::in,
+    message::in(message), screen_transition(sent)::out, io::di, io::uo) is det.
+
 :- type continue_base
     --->    postponed_message
     ;       arbitrary_message.
 
-:- pred continue_from_message(prog_config::in, crypto::in, screen::in, continue_base::in,
-    message::in(message), screen_transition(sent)::out, io::di, io::uo) is det.
+:- pred continue_from_message(prog_config::in, crypto::in, screen::in,
+    continue_base::in, message::in(message), screen_transition(sent)::out,
+    io::di, io::uo) is det.
 
     % Exported for resend.
     %
@@ -65,7 +69,6 @@
 :- import_module pair.
 :- import_module require.
 :- import_module set.
-:- import_module std_util.
 :- import_module string.
 
 :- import_module addressbook.
@@ -75,12 +78,14 @@
 :- import_module curs.
 :- import_module curs.panel.
 :- import_module detect_mime_type.
+:- import_module forward.
 :- import_module gpgme.
 :- import_module gpgme.key.
 :- import_module maildir.
 :- import_module make_temp.
 :- import_module message_file.
 :- import_module mime_type.
+:- import_module notmuch_config.
 :- import_module pager.
 :- import_module path_expand.
 :- import_module quote_arg.
@@ -90,6 +95,7 @@
 :- import_module rfc6068.
 :- import_module scrollable.
 :- import_module send_util.
+:- import_module size_util.
 :- import_module splitmix64.
 :- import_module string_util.
 :- import_module tags.
@@ -415,13 +421,32 @@ start_reply_to_message_id(Config, Crypto, Screen, MessageId, ReplyKind,
 
 %-----------------------------------------------------------------------------%
 
-continue_from_message(Config, Crypto, Screen, ContinueBase, Message, Transition, !IO)
-        :-
+start_forward(Config, Crypto, Screen, Message, Transition, !IO) :-
+    get_default_account(Config, MaybeAccount),
+    (
+        MaybeAccount = yes(Account),
+        get_from_address_as_string(Account, From)
+    ;
+        MaybeAccount = no,
+        From = ""
+    ),
+    prepare_forward_message(Message, From, Headers, Body, AttachmentParts),
+    list.map(to_old_attachment, AttachmentParts, Attachments),
+    MaybeOldDraft = no,
+    WasEncrypted = contains(Message ^ m_tags, encrypted_tag),
+    DraftSign = no,
+    create_edit_stage(Config, Crypto, Screen, Headers, Body, Attachments,
+        MaybeOldDraft, WasEncrypted, DraftSign, Transition, !IO).
+
+%-----------------------------------------------------------------------------%
+
+continue_from_message(Config, Crypto, Screen, ContinueBase, Message,
+        Transition, !IO) :-
     MessageId = Message ^ m_id,
     Headers0 = Message ^ m_headers,
     Tags0 = Message ^ m_tags,
     Body0 = Message ^ m_body,
-    first_text_part(Body0, Text, AttachmentParts),
+    select_body_text_and_attachments(Body0, Text, AttachmentParts),
     list.map(to_old_attachment, AttachmentParts, Attachments),
     WasEncrypted = contains(Tags0, encrypted_tag),
     DraftSign = contains(Tags0, draft_sign_tag),
@@ -461,42 +486,6 @@ continue_from_message(Config, Crypto, Screen, ContinueBase, Message, Transition,
             io.error_message(Error)], Warning),
         Transition = screen_transition(not_sent, set_warning(Warning))
     ).
-
-:- pred first_text_part(list(part)::in, string::out, list(part)::out)
-    is det.
-
-first_text_part([], "", []).
-first_text_part([Part | Parts], Text, AttachmentParts) :-
-    PartContent = Part ^ pt_content,
-    (
-        PartContent = text(Text),
-        AttachmentParts = Parts
-    ;
-        PartContent = subparts(Encryption, _Signatures, SubParts),
-        (
-            ( Encryption = not_encrypted
-            ; Encryption = encrypted
-            ; Encryption = decryption_bad
-            ),
-            first_text_part(SubParts, Text, AttachmentParts)
-        ;
-            Encryption = decryption_good,
-            filter(isnt(part_is_application_pgp_encrypted),
-                SubParts, OtherSubParts),
-            first_text_part(OtherSubParts, Text, AttachmentParts)
-        )
-    ;
-        ( PartContent = encapsulated_messages(_)
-        ; PartContent = unsupported
-        ),
-        first_text_part(Parts, Text, AttachmentParts0),
-        AttachmentParts = [Part | AttachmentParts0]
-    ).
-
-:- pred part_is_application_pgp_encrypted(part::in) is semidet.
-
-part_is_application_pgp_encrypted(Part) :-
-    Part ^ pt_type = mime_type.application_pgp_encrypted.
 
 :- pred to_old_attachment(part::in, attachment::out) is det.
 
@@ -663,41 +652,55 @@ parse_and_expand_addresses(Config, Opt, Input, header_value(Output), Addresses,
 parse_and_expand_addresses_string(Config, Opt, Input, Output, Addresses, Valid,
         !IO) :-
     parse_address_list(Opt, Input, Addresses0),
-    list.map_foldl(maybe_expand_address(Config, Opt), Addresses0, Addresses,
-        !IO),
+    list.map_foldl2(maybe_expand_address(Config, Opt), Addresses0, Addresses,
+        no, _Cache, !IO),
     address_list_to_string(no_encoding, Addresses, Output, Valid).
 
 :- pred maybe_expand_address(prog_config::in, quote_opt::in,
-    address::in, address::out, io::di, io::uo) is det.
+    address::in, address::out,
+    maybe(notmuch_config)::in, maybe(notmuch_config)::out, io::di, io::uo)
+    is det.
 
-maybe_expand_address(Config, Opt, Address0, Address, !IO) :-
+maybe_expand_address(Config, Opt, Address0, Address, !Cache, !IO) :-
     (
         Address0 = mailbox(Mailbox0),
-        maybe_expand_mailbox(Config, Opt, Mailbox0, Mailbox, !IO),
+        maybe_expand_mailbox(Config, Opt, Mailbox0, Mailbox, !Cache, !IO),
         Address = mailbox(Mailbox)
     ;
         Address0 = group(DisplayName, Mailboxes0),
-        list.map_foldl(maybe_expand_mailbox(Config, Opt),
-            Mailboxes0, Mailboxes, !IO),
+        list.map_foldl2(maybe_expand_mailbox(Config, Opt),
+            Mailboxes0, Mailboxes, !Cache, !IO),
         Address = group(DisplayName, Mailboxes)
     ).
 
 :- pred maybe_expand_mailbox(prog_config::in, quote_opt::in,
-    mailbox::in, mailbox::out, io::di, io::uo) is det.
+    mailbox::in, mailbox::out,
+    maybe(notmuch_config)::in, maybe(notmuch_config)::out, io::di, io::uo)
+    is det.
 
-maybe_expand_mailbox(Config, Opt, Mailbox0, Mailbox, !IO) :-
+maybe_expand_mailbox(Config, Opt, Mailbox0, Mailbox, !Cache, !IO) :-
     (
         Mailbox0 = mailbox(_, _),
         Mailbox = Mailbox0
     ;
         Mailbox0 = bad_mailbox(PotentialAlias),
-        search_addressbook(Config, PotentialAlias, MaybeFound0, !IO),
         (
-            MaybeFound0 = no,
-            search_notmuch_address_top(Config, PotentialAlias, MaybeFound, !IO)
+            !.Cache = yes(NotmuchConfig)
         ;
-            MaybeFound0 = yes(_),
-            MaybeFound = MaybeFound0
+            !.Cache = no,
+            get_notmuch_config(Config, ResConfig, !IO),
+            (
+                ResConfig = ok(NotmuchConfig)
+            ;
+                ResConfig = error(_Error),
+                NotmuchConfig = empty_notmuch_config
+            ),
+            !:Cache = yes(NotmuchConfig)
+        ),
+        ( search_addressbook(NotmuchConfig, PotentialAlias, Expansion0) ->
+            MaybeFound = yes(Expansion0)
+        ;
+            search_notmuch_address_top(Config, PotentialAlias, MaybeFound, !IO)
         ),
         (
             MaybeFound = yes(Expansion),
@@ -1598,17 +1601,19 @@ draw_crypto_line(Attrs, Panel, CryptoInfo, !IO) :-
 draw_attachment_line(Attrs, Panel, Attachment, LineNr, IsCursor, !IO) :-
     (
         Attachment = old_attachment(Part),
-        Type = Part ^ pt_type,
-        MaybeFilename = Part ^ pt_filename,
+        Part = part(_MessageId, _PartId, ContentType, MaybeContentDisposition,
+            _Content, MaybeFilename, MaybeContentLength, _MaybeCTE,
+            _IsDecrypted),
         (
-            MaybeFilename = yes(Filename)
+            MaybeFilename = yes(filename(Filename))
         ;
             MaybeFilename = no,
             Filename = "(no filename)"
-        ),
-        Size = -1
+        )
     ;
-        Attachment = new_attachment(Type, _, Filename, Size)
+        Attachment = new_attachment(ContentType, _, Filename, Size),
+        MaybeContentDisposition = no,
+        MaybeContentLength = yes(content_length(Size))
     ),
     panel.erase(Panel, !IO),
     panel.move(Panel, 0, 10, !IO),
@@ -1622,17 +1627,31 @@ draw_attachment_line(Attrs, Panel, Attachment, LineNr, IsCursor, !IO) :-
         FilenameAttr = Attr
     ),
     draw(Panel, FilenameAttr, Filename, !IO),
-    draw(Panel, Attr, " (" ++ mime_type.to_string(Type) ++ ")", !IO),
-    ( Size >= 1024 * 1024 ->
-        SizeM = float(Size) / (1024.0 * 1024.0),
-        draw(Panel, format(" %.1f MiB", [f(SizeM)]), !IO)
-    ; Size >= 1024 ->
-        SizeK = float(Size) / 1024.0,
-        draw(Panel, format(" %.1f KiB", [f(SizeK)]), !IO)
-    ; Size >= 0 ->
-        draw(Panel, format(" %d bytes", [i(Size)]), !IO)
+    draw(Panel, Attr, " (", !IO),
+    draw(Panel, Attr, mime_type.to_string(ContentType), !IO),
+    /*
+    (
+        MaybeContentCharset = yes(content_charset(Charset)),
+        draw(Panel, Attr, "; charset=" ++ Charset, !IO)
+    ;
+        MaybeContentCharset = no
+    ),
+    */
+    (
+        MaybeContentDisposition = yes(content_disposition(Disposition)),
+        Disposition \= "attachment"
+    ->
+        draw(Panel, Attr, "; " ++ Disposition, !IO)
     ;
         true
+    ),
+    draw(Panel, Attr, ")", !IO),
+    (
+        MaybeContentLength = yes(content_length(Length)),
+        % This is the encoded size.
+        draw2(Panel, " ", format_approx_length(Length), !IO)
+    ;
+        MaybeContentLength = no
     ).
 
 :- pred draw_attachments_label(compose_attrs::in, list(panel)::in,
@@ -2105,54 +2124,52 @@ maybe_cons_unstructured(SkipEmpty, Options, FieldName, Value, !Acc) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred make_text_and_attachments_mime_part(content_transfer_encoding::in,
+:- pred make_text_and_attachments_mime_part(write_content_transfer_encoding::in,
     string::in, list(attachment)::in, boundary::in, mime_part::out) is det.
 
 make_text_and_attachments_mime_part(TextCTE, Text, Attachments, MixedBoundary,
         MimePart) :-
-    make_text_mime_part(inline, TextCTE, Text, TextPart),
+    make_text_mime_part(write_content_disposition(inline, no), TextCTE, Text,
+        TextPart),
     (
         Attachments = [],
         MimePart = TextPart
     ;
         Attachments = [_ | _],
-        MimePart = composite(multipart_mixed, MixedBoundary, yes(inline),
-            yes(cte_8bit), [TextPart | AttachmentParts]),
+        MimePart = composite(multipart_mixed, MixedBoundary,
+            yes(write_content_disposition(inline, no)), yes(cte_8bit),
+            [TextPart | AttachmentParts]),
         list.map(make_attachment_mime_part(TextCTE), Attachments,
             AttachmentParts)
     ).
 
-:- pred make_text_mime_part(content_disposition::in,
-    content_transfer_encoding::in, string::in, mime_part::out) is det.
+:- pred make_text_mime_part(write_content_disposition::in,
+    write_content_transfer_encoding::in, string::in, mime_part::out) is det.
 
 make_text_mime_part(Disposition, TextCTE, Text, MimePart) :-
     % XXX detect charset
     MimePart = discrete(text_plain(yes(utf8)), yes(Disposition), yes(TextCTE),
         text(Text)).
 
-:- pred make_attachment_mime_part(content_transfer_encoding::in,
+:- pred make_attachment_mime_part(write_content_transfer_encoding::in,
     attachment::in, mime_part::out) is det.
 
 make_attachment_mime_part(TextCTE, Attachment, MimePart) :-
     (
         Attachment = old_attachment(OldPart),
-        OldType = mime_type.to_string(OldPart ^ pt_type),
-        OldContent = OldPart ^ pt_content,
-        MaybeFileName = OldPart ^ pt_filename,
-        (
-            MaybeFileName = yes(FileName),
-            Disposition = attachment(yes(filename(FileName)))
-        ;
-            MaybeFileName = no,
-            Disposition = attachment(no)
-        ),
+        OldPart = part(_MessageId, _OldPartId, OldContentType,
+            OldContentDisposition, OldContent, OldFileName, _OldContentLength,
+            _OldCTE, _IsDecrypted),
+        ContentType = content_type(mime_type.to_string(OldContentType)),
+        convert_old_content_disposition(OldContentDisposition, OldFileName,
+            MaybeWriteContentDisposition),
         (
             OldContent = text(Text),
-            MimePart = discrete(content_type(OldType), yes(Disposition),
+            MimePart = discrete(ContentType, MaybeWriteContentDisposition,
                 yes(cte_8bit), text(Text))
         ;
             OldContent = unsupported,
-            MimePart = discrete(content_type(OldType), yes(Disposition),
+            MimePart = discrete(ContentType, MaybeWriteContentDisposition,
                 yes(cte_base64), external(OldPart))
         ;
             OldContent = subparts(_, _, _),
@@ -2163,16 +2180,50 @@ make_attachment_mime_part(TextCTE, Attachment, MimePart) :-
         )
     ;
         Attachment = new_attachment(Type, Content, FileName, _Size),
-        Disposition = attachment(yes(filename(FileName))),
+        WriteContentDisposition = write_content_disposition(attachment,
+            yes(filename(FileName))),
         (
             Content = text(Text),
-            make_text_mime_part(Disposition, TextCTE, Text, MimePart)
+            make_text_mime_part(WriteContentDisposition, TextCTE, Text,
+                MimePart)
         ;
             Content = binary_base64(Base64),
             TypeString = mime_type.to_string(Type),
-            MimePart = discrete(content_type(TypeString), yes(Disposition),
-                yes(cte_base64), base64(Base64))
+            MimePart = discrete(content_type(TypeString),
+                yes(WriteContentDisposition), yes(cte_base64), base64(Base64))
         )
+    ).
+
+:- pred convert_old_content_disposition(maybe(content_disposition)::in,
+    maybe(filename)::in, maybe(write_content_disposition)::out) is det.
+
+convert_old_content_disposition(OldContentDisposition, OldFileName,
+        MaybeWriteContentDisposition) :-
+    (
+        OldFileName = no,
+        OldContentDisposition = no
+    ->
+        MaybeWriteContentDisposition = no
+    ;
+        (
+            OldContentDisposition = no,
+            DispositionType = attachment
+        ;
+            OldContentDisposition = yes(OldDispositionType),
+            DispositionType = convert_old_disposition_type(OldDispositionType)
+        ),
+        MaybeWriteContentDisposition = yes(write_content_disposition(
+            DispositionType, OldFileName))
+    ).
+
+:- func convert_old_disposition_type(content_disposition) =
+    write_content_disposition_type.
+
+convert_old_disposition_type(DispositionType) =
+    ( DispositionType = content_disposition("inline") ->
+        inline
+    ;
+        attachment
     ).
 
 %-----------------------------------------------------------------------------%

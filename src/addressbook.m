@@ -8,6 +8,7 @@
 :- import_module list.
 :- import_module maybe.
 
+:- import_module notmuch_config.
 :- import_module prog_config.
 :- import_module screen.
 
@@ -15,8 +16,8 @@
 
 :- func addressbook_section = string.
 
-:- pred search_addressbook(prog_config::in, string::in, maybe(string)::out,
-    io::di, io::uo) is det.
+:- pred search_addressbook(notmuch_config::in, string::in, string::out)
+    is semidet.
 
 :- pred search_notmuch_address(prog_config::in, string::in, list(string)::out,
     io::di, io::uo) is det.
@@ -64,38 +65,33 @@ is_alias_char(C) :-
 
 %-----------------------------------------------------------------------------%
 
-search_addressbook(Config, Alias, MaybeFound, !IO) :-
-    ( string.all_match(is_alias_char, Alias) ->
-        Key = addressbook_section ++ "." ++ Alias,
-        get_notmuch_config(Config, Key, Res, !IO),
-        (
-            Res = ok(Expansion),
-            MaybeFound = yes(Expansion)
-        ;
-            Res = error(_),
-            MaybeFound = no
-        )
-    ;
-        MaybeFound = no
-    ).
+search_addressbook(NotmuchConfig, Alias, Expansion) :-
+    string.all_match(is_alias_char, Alias),
+    search(NotmuchConfig, addressbook_section, Alias, Expansion).
 
 %-----------------------------------------------------------------------------%
 
 search_notmuch_address(Config, SearchString, NameAddrs, !IO) :-
-    run_notmuch(Config,
-        [
-            "address", "--format=json", "--output=sender", "--output=count",
-            "--deduplicate=address", "date:1y..now", "from:" ++ SearchString
-        ],
-        no_suspend_curses,
-        parse_address_count_list, Res, !IO),
-    (
-        Res = ok(Pairs0),
-        sort(descending, Pairs0, Pairs),
-        map(snd, Pairs, NameAddrs)
-    ;
-        Res = error(_),
+    ( string.prefix(SearchString, "/") ->
+        % Avoid notmuch-address interpreting the string as an incomplete regex.
         NameAddrs = []
+    ;
+        run_notmuch(Config,
+            [
+                "address", "--format=json", "--output=sender", "--output=count",
+                "--deduplicate=address", "date:1y..now",
+                "from:" ++ SearchString
+            ],
+            no_suspend_curses,
+            parse_address_count_list, Res, !IO),
+        (
+            Res = ok(Pairs0),
+            sort(descending, Pairs0, Pairs),
+            map(snd, Pairs, NameAddrs)
+        ;
+            Res = error(_),
+            NameAddrs = []
+        )
     ).
 
 search_notmuch_address_top(Config, SearchString, MaybeFound, !IO) :-

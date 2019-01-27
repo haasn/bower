@@ -22,12 +22,12 @@ At compile time:
 
 * Mercury compiler (11.07 or later, including release-of-the-day);
   currently available at <http://dl.mercurylang.org/index.html>
-* gpgme (GnuPG Made Easy)
 
 At run time:
 
 * notmuch
 * ncurses with wide character support
+* gpgme (GnuPG Made Easy)
 * GNU coreutils: base64
 * SMTP client to send messages (configurable)
 * lynx to dump HTML emails (configurable)
@@ -71,10 +71,24 @@ This will produce `bower.1` for installation into your `man` search path.
 Configuration
 =============
 
-The bower configuration file is located at `~/.config/bower/bower.conf`.
-See `bower.conf.sample` for details.
+You can configure bower by creating a file in one of the following locations,
+in order of priority:
 
-In particular, bower is designed such that it can be run on the local
+  - the path specified in the environment variable `BOWER_CONFIG` (if set)
+
+  - the path `$XDG_CONFIG_HOME/bower/bower.conf`
+    (if the environment variable `XDG_CONFIG_HOME` is set and non-empty)
+
+  - the path `$HOME/.config/bower/bower.conf`
+    (if the environment variable `HOME` is set)
+
+  - a path `$basedir/bower/bower.conf` where `$basedir` is an element of the
+    colon-separated list given in the environment variable `XDG_CONFIG_DIRS`
+    (defaults to `/etc/xdg`)
+
+The details of the configuration file are given in `bower.conf.sample`.
+
+Bower is designed such that it can be run on the local
 machine but call out to notmuch on a remote machine (that holds your
 mail) via ssh.  The advantage is that you can start helper programs on
 the local machine (e.g. a web browser or image viewer), and add or save
@@ -82,9 +96,8 @@ attachments on the local filesystem, even if your mail archive is stored
 on a different machine.
 
 Bower also keeps some centralised information in the notmuch configuration
-file `~/.notmuch-config`.  You may wish to tell bower about your Maildir
-hierarchy, namely where to place draft and sent messages.
-The defaults are given here:
+file.  You may wish to tell bower about your Maildir hierarchy, namely
+where to place draft and sent messages.  The defaults are given here:
 
     [bower:maildir]
     drafts_folder = Drafts
@@ -98,7 +111,7 @@ these search exclusions:
 
 
 Usage
-=======
+=====
 
 Run `bower` or `bower SEARCH-TERMS` to start.  By default, Bower displays the
 last week's worth of mail.  You can change that by setting the `~default`
@@ -110,8 +123,8 @@ Views
 
 There are two main views: the index, and the combined thread/pager.
 
-Index view
-----------
+Index view keys
+---------------
 
 This view shows the notmuch search results for the current query.
 The keys are:
@@ -143,55 +156,12 @@ The keys are:
     e               reply to everyone
     L               reply to list
     R               recall postponed message
-    @               add to addressbook
+    @               add to address book
 
     q               quit
 
-Index view limit command
-------------------------
-
-The `l` (limit) command slightly extends the notmuch search term syntax with
-these macros:
-
-    ~A              disable default cap on number of search results
-    ~F              tag:flagged
-    ~U              tag:unread
-    ~D              tag:deleted
-    ~d DATE..DATE
-    ~d DATE..
-    ~d ..DATE
-    ~d DATE
-
-By default, a maximum of 300 search results will be displayed.
-Add ~A to the search string to get all results.
-
-The ~d syntax passes dates through to notmuch as a "date:" range;
-see `notmuch-search-terms`(7) for the date range syntax.
-You may use curly brackets to surround date strings containing spaces.
-The single date form ~d DATE is equivalent to ~d DATE..DATE.
-
-Some examples:
-
-    ~d 2011-06-01..
-    ~d {2 weeks ago}..{last week}
-    ~d yesterday
-
-In addition to the built-in macros, you can add your own search term
-expansions.  See below for "Search term aliases".
-
-
-Index view behaviour
---------------------
-
-Tag modifications in the index view are (mostly) performed asynchronously
-to minimise stutter.  Remember to quit properly using 'q' to ensure all
-tag modifications are completed before exiting.  Tag modifications will
-be retried a limited number of times on failure, e.g. because the notmuch
-database is locked (this was a problem with old notmuch versions).
-
-
-Thread/pager view
------------------
+Thread/pager view keys
+----------------------
 
 This view pages through an entire thread.  The keys are:
 
@@ -226,10 +196,11 @@ This view pages through an entire thread.  The keys are:
     r               reply to sender
     e               reply to everyone
     L               reply to list
+    W               forward message
     B               resend message to another address ("bounce")
     E               use current message as a template for a new message
     R               recall postponed message
-    @               add to addressbook
+    @               add to address book
 
     v               highlight next visible attachment or URL or folded text
     V               highlight next visible attachment or top of message
@@ -244,34 +215,61 @@ This view pages through an entire thread.  The keys are:
     I               return to index, removing 'unread' tag on all messages
     A               return to index, removing 'inbox' and 'unread' on messages
 
-Unlike the index view, tag modifications in the thread/pager view will only
-applied upon returning to the index view. If bower is terminated before
-returning to the index view then all tag modifications will be lost.
-
 The 'o' command, which opens parts and URLs, takes a command using Unix shell
 quoting syntax.  If the command ends with an unquoted '&' character then the
 command will be run in the background.
 
+Note: forward (W) and edit-as-new (E) currently will not create a proper
+message template for messages that are manually decrypted in the thread view.
+A workaround is to set `crypto.decrypt_by_default = true` in the bower
+configuration so that encrypted messages are automatically decrypted upon
+opening a thread.
 
-Polling for new messages
-------------------------
 
-By default, bower will call `notmuch count` every 60 seconds in both the index
-and thread views in order to notify you of new unread messages matching the
-search terms in the index, or new messages in the current thread. You can
-change the polling frequency or disable it with the configuration option
-`ui.poll_period_secs`.
+Limit command syntax extensions
+===============================
 
-You can also configure a command to run when new messages are found
-using the `command.poll_notify` option.
+The `l` (limit) command in the index view slightly extends the notmuch search
+term syntax with these macros:
+
+    ~A              disable default cap on number of search results
+    ~F              tag:flagged
+    ~U              tag:unread
+    ~D              tag:deleted
+    ~d DATE..DATE
+    ~d DATE..
+    ~d ..DATE
+    ~d DATE
+
+By default, a maximum of 300 search results will be displayed.
+Add ~A to the search string to get all results.
+
+The ~d syntax passes dates through to notmuch as a "date:" range;
+see `notmuch-search-terms`(7) for the date range syntax.
+You may use curly brackets to surround date strings containing spaces.
+The single date form ~d DATE is equivalent to ~d DATE..DATE.
+
+Some examples:
+
+    ~d 2011-06-01..
+    ~d {2 weeks ago}..{last week}
+    ~d yesterday
 
 
 Search term aliases
 -------------------
 
-Bower will try to expand search terms written with the syntax `~WORD`.
-The expansions should be added to the notmuch config file `~/.notmuch-config`
-in a section called `[bower:search_alias]`.  Expansions may make use of other
+In addition to the built-in macros, bower will try to expand tokens of the
+form `~NAME` in two ways:
+
+  - if there is a search term alias called `NAME` then the token will
+    be replaced with its expansion
+
+  - if there is a notmuch named query called `NAME` then the token will
+    be replaced with `query:NAME`
+
+Search term aliases are defined in the notmuch config file in a section
+called `[bower:search_alias]`. Expansions may make use of other
 (non-recursive) expansions.  For example:
 
     [bower:search_alias]
@@ -287,26 +285,61 @@ in a section called `[bower:search_alias]`.  Expansions may make use of other
 As mentioned earlier, the `~default` alias sets the initial search query
 if you run `bower` without command-line arguments.
 
-You can tab complete search term aliases.
+The differences between search term aliases and notmuch named queries are:
+
+  - search term aliases are specific to bower
+  - search term aliases may use bower-specific syntax, and refer to other
+    search term aliases
+  - named queries are stored in the notmuch database instead of the notmuch
+    config file
+
+You can tab complete search term aliases and notmuch named queries.
 
 
-Simple addressbook
-------------------
+Tag modification behaviour
+==========================
 
-Bower can look up addresses using the `notmuch address` command.
-Only addresses that appear in the `From` header of messages from the
-last year will be found. This restriction is for better performance,
-and also avoids finding stale email addresses.
+Tag modifications in the index view are (mostly) performed asynchronously
+to minimise stutter.  Remember to quit properly using 'q' to ensure all
+tag modifications are completed before exiting.  Tag modifications will
+be retried a limited number of times on failure, e.g. because the notmuch
+database is locked (this was a problem with old notmuch versions).
 
-Address aliases can also be kept in the notmuch config file
-`~/.notmuch-config` in a section called `[bower:addressbook]`.
-For example:
+Unlike the index view, tag modifications in the thread/pager view will only
+applied upon returning to the index view. If bower is terminated before
+returning to the index view then any tag modifications made in the thread
+view will be lost.
+
+
+Polling for new messages
+========================
+
+By default, bower will call `notmuch count` every 60 seconds in both the index
+and thread views in order to notify you of new unread messages matching the
+search terms in the index, or new messages in the current thread. You can
+change the polling frequency or disable it with the configuration option
+`ui.poll_period_secs`.
+
+You can also configure a command to run when new messages are found
+using the `command.poll_notify` option.
+
+
+Simple address book
+===================
+
+Bower can use `notmuch address` command to look up email addresses where
+required, e.g. when composing a new message. Only addresses that appear
+in the `From` header of messages from the last year will be considered;
+this restriction improves performance and avoids finding stale email addresses.
+
+Address aliases can also be kept in the notmuch config file in a section
+called `[bower:addressbook]`.  For example:
 
     [bower:addressbook]
     someone = Someone <someone@example.org>
     someoneelse = someoneelse@example.org
 
-You can add to the addressbook using '@' in the index or thread views.
+You can add to the address book using '@' in the index or thread views.
 
 Tab completion will prefer address aliases over addresses found by
 `notmuch address`.
@@ -337,8 +370,8 @@ address on the account.  Bower performs two steps when sending a message:
     then no command is run.
 
 If both the `sendmail` and `post_sendmail` commands will run on the same
-remote server then there is a slightly inefficiency because a single
-message would need to be transferred to the remote server two times.
+remote server then there is a slight inefficiency because a single
+message would need to be transferred to the remote server twice.
 If that is a concern, you could combine the two steps into a single script
 to be run at the `sendmail` step, and disable the `post_sendmail` command.
 
