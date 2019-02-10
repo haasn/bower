@@ -410,7 +410,7 @@ start_reply_to_message_id(Config, Crypto, Screen, MessageId, ReplyKind,
             start_reply(Config, Crypto, Screen, Message, ReplyKind, Transition,
                 !IO)
         ;
-            Message = excluded_message(_),
+            Message = excluded_message(_, _, _, _, _),
             Warning = "Excluded message.",
             Transition = screen_transition(not_sent, set_warning(Warning))
         )
@@ -688,7 +688,8 @@ maybe_expand_mailbox(Config, Opt, Mailbox0, Mailbox, !Cache, !IO) :-
             !.Cache = yes(NotmuchConfig)
         ;
             !.Cache = no,
-            get_notmuch_config(Config, ResConfig, !IO),
+            get_notmuch_command(Config, Notmuch),
+            get_notmuch_config(Notmuch, ResConfig, !IO),
             (
                 ResConfig = ok(NotmuchConfig)
             ;

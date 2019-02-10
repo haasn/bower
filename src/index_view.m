@@ -7,14 +7,15 @@
 :- import_module io.
 
 :- import_module crypto.
+:- import_module notmuch_config.
 :- import_module prog_config.
 :- import_module screen.
 :- import_module view_common.
 
 %-----------------------------------------------------------------------------%
 
-:- pred open_index(prog_config::in, crypto::in, screen::in, string::in,
-    common_history::in, io::di, io::uo) is det.
+:- pred open_index(prog_config::in, notmuch_config::in, crypto::in, screen::in,
+    string::in, common_history::in, io::di, io::uo) is det.
 
 %-----------------------------------------------------------------------------%
 %-----------------------------------------------------------------------------%
@@ -127,7 +128,7 @@
     --->    continue
     ;       continue_no_draw
     ;       resize
-    ;       open_pager(thread_id)
+    ;       open_pager(thread_id, set(tag))
     ;       enter_limit(maybe(string))
     ;       refresh_all
     ;       start_compose
@@ -167,13 +168,15 @@
 
 %-----------------------------------------------------------------------------%
 
-open_index(Config, Crypto, Screen, SearchString, !.CommonHistory, !IO) :-
+open_index(Config, NotmuchConfig, Crypto, Screen, SearchString,
+        !.CommonHistory, !IO) :-
     current_timestamp(Time, !IO),
     ( SearchString = "" ->
         SearchTokens = [],
         Threads = []
     ;
-        predigest_search_string(Config, SearchString, ParseRes, !IO),
+        predigest_search_string(Config, yes(NotmuchConfig), SearchString,
+            ParseRes, !IO),
         (
             ParseRes = ok(SearchTokens),
             search_terms_with_progress(Config, Screen, SearchTokens,
@@ -329,7 +332,7 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         recreate_screen(NewScreen, !IndexInfo),
         index_loop(NewScreen, redraw, !.IndexInfo, !IO)
     ;
-        Action = open_pager(ThreadId),
+        Action = open_pager(ThreadId, IncludeTags),
         flush_async_with_progress(Screen, !IO),
         Config = !.IndexInfo ^ i_config,
         Crypto = !.IndexInfo ^ i_crypto,
@@ -344,8 +347,9 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
         ;
             MaybeSearch = no
         ),
-        open_thread_pager(Config, Crypto, Screen, ThreadId, IndexPollTerms,
-            MaybeSearch, Transition, CommonHistory0, CommonHistory, !IO),
+        open_thread_pager(Config, Crypto, Screen, ThreadId, IncludeTags,
+            IndexPollTerms, MaybeSearch, Transition,
+            CommonHistory0, CommonHistory, !IO),
         handle_screen_transition(Screen, NewScreen, Transition,
             TagUpdates, !IndexInfo, !IO),
         effect_thread_pager_changes(TagUpdates, !IndexInfo, !IO),
@@ -371,7 +375,7 @@ index_loop(Screen, OnEntry, !.IndexInfo, !IO) :-
             add_history_nodup(LimitString, History0, History),
             !IndexInfo ^ i_common_history ^ ch_limit_history := History,
             current_timestamp(Time, !IO),
-            predigest_search_string(Config, LimitString, ParseRes, !IO),
+            predigest_search_string(Config, no, LimitString, ParseRes, !IO),
             (
                 ParseRes = ok(Tokens),
                 search_terms_with_progress(Config, Screen, Tokens,
@@ -756,7 +760,8 @@ enter(Info, Action) :-
     Scrollable = Info ^ i_scrollable,
     ( get_cursor_line(Scrollable, _, CursorLine) ->
         ThreadId = CursorLine ^ i_id,
-        Action = open_pager(ThreadId)
+        IncludeTags = CursorLine ^ i_tags,
+        Action = open_pager(ThreadId, IncludeTags)
     ;
         Action = continue
     ).
@@ -888,7 +893,7 @@ handle_recall(!Screen, Sent, !IndexInfo, !IO) :-
             handle_screen_transition(!Screen, TransitionB, Sent, !IndexInfo,
                 !IO)
         ;
-            Message = excluded_message(_),
+            Message = excluded_message(_, _, _, _, _),
             Sent = not_sent
         )
     ;
@@ -1526,7 +1531,7 @@ refresh_all(Screen, Verbose, !Info, !IO) :-
     % refresh, so expand the search terms from the beginning.
     Config = !.Info ^ i_config,
     Terms = !.Info ^ i_search_terms,
-    predigest_search_string(Config, Terms, ParseRes, !IO),
+    predigest_search_string(Config, no, Terms, ParseRes, !IO),
     (
         ParseRes = ok(Tokens),
         (

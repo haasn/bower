@@ -8,9 +8,12 @@
 :- import_module io.
 :- import_module list.
 :- import_module maybe.
+:- import_module set.
 
 :- import_module color.
+:- import_module data.
 :- import_module mime_type.
+:- import_module notmuch_config.
 :- import_module quote_arg.
 :- import_module rfc5322.
 :- import_module shell_word.
@@ -20,7 +23,7 @@
 :- type prog_config.
 
 :- type load_prog_config_result
-    --->    ok(prog_config)
+    --->    ok(prog_config, notmuch_config)
     ;       errors(list(string)).
 
 :- type account.
@@ -85,6 +88,8 @@
 
 :- pred get_post_sendmail_action(account::in, post_sendmail::out) is det.
 
+:- pred get_exclude_tags(prog_config::in, set(tag)::out) is det.
+
 :- func generic_attrs(prog_config) = generic_attrs.
 :- func status_attrs(prog_config) = status_attrs.
 :- func pager_attrs(prog_config) = pager_attrs.
@@ -107,7 +112,6 @@
 :- import_module parsing_utils.
 :- import_module string.
 
-:- import_module callout.       % XXX cyclic
 :- import_module config.
 :- import_module rfc5322.parser.
 :- import_module rfc5322.writer.
@@ -130,6 +134,7 @@
                 message_id_right :: string,
                 accounts        :: list(account),
                 default_account :: maybe(account),
+                exclude_tags    :: set(tag),
                 colors          :: colors
             ).
 
@@ -179,19 +184,19 @@ load_prog_config(Res, !IO) :-
     io::di, io::uo) is cc_multi.
 
 load_prog_config_2(Config, Res, !IO) :-
-    make_prog_config(Config, ProgConfig, [], RevErrors, !IO),
+    make_prog_config(Config, ProgConfig, NotmuchConfig, [], RevErrors, !IO),
     (
         RevErrors = [],
-        Res = ok(ProgConfig)
+        Res = ok(ProgConfig, NotmuchConfig)
     ;
         RevErrors = [_ | _],
         Res = errors(reverse(RevErrors))
     ).
 
-:- pred make_prog_config(config::in, prog_config::out,
+:- pred make_prog_config(config::in, prog_config::out, notmuch_config::out,
     list(string)::in, list(string)::out, io::di, io::uo) is cc_multi.
 
-make_prog_config(Config, ProgConfig, !Errors, !IO) :-
+make_prog_config(Config, ProgConfig, NotmuchConfig, !Errors, !IO) :-
     ( search_config(Config, "command", "notmuch", Notmuch0) ->
         parse_command(Notmuch0, Notmuch, !Errors)
     ;
@@ -330,10 +335,19 @@ make_prog_config(Config, ProgConfig, !Errors, !IO) :-
         cons("unable to determine host name", !Errors)
     ),
 
+    get_notmuch_config(Notmuch, ResNotmuchConfig, !IO),
+    (
+        ResNotmuchConfig = ok(NotmuchConfig)
+    ;
+        ResNotmuchConfig = error(NotmuchConfigError),
+        cons(error_message(NotmuchConfigError), !Errors),
+        NotmuchConfig = empty_notmuch_config
+    ),
+
     parse_accounts(Config, Accounts0, AccountErrors),
     (
         AccountErrors = [],
-        fill_default_mailbox(Notmuch, Accounts0, Accounts, !Errors, !IO),
+        fill_default_mailbox(NotmuchConfig, Accounts0, Accounts, !Errors),
         % XXX check for duplicate from_address in accounts
         pick_default_account(Accounts, DefaultAccount, !Errors)
     ;
@@ -342,6 +356,8 @@ make_prog_config(Config, ProgConfig, !Errors, !IO) :-
         DefaultAccount = no,
         append(AccountErrors, !Errors)
     ),
+
+    get_notmuch_search_exclude_tags(NotmuchConfig, ExcludeTags),
 
     make_colors(Config, Colors),
 
@@ -359,6 +375,7 @@ make_prog_config(Config, ProgConfig, !Errors, !IO) :-
     ProgConfig ^ message_id_right = MessageIdRight,
     ProgConfig ^ accounts = Accounts,
     ProgConfig ^ default_account = DefaultAccount,
+    ProgConfig ^ exclude_tags = ExcludeTags,
     ProgConfig ^ colors = Colors.
 
 %-----------------------------------------------------------------------------%
@@ -437,7 +454,6 @@ parse_filter(Name, Value, !Filters, !Errors) :-
     ).
 
 %-----------------------------------------------------------------------------%
-
 
 :- pred check_poll_period_secs(string::in, maybe(int)::out,
     list(string)::in, list(string)::out) is det.
@@ -580,26 +596,22 @@ check_sendmail_command(command_prefix(shell_quoted(Command), _), !Errors) :-
         true
     ).
 
-:- pred fill_default_mailbox(command_prefix::in,
+:- pred fill_default_mailbox(notmuch_config::in,
     list(account(maybe(mailbox)))::in, list(account)::out,
-    list(string)::in, list(string)::out, io::di, io::uo) is det.
+    list(string)::in, list(string)::out) is det.
 
-fill_default_mailbox(Notmuch, Accounts0, Accounts, !Errors, !IO) :-
+fill_default_mailbox(Config, Accounts0, Accounts, !Errors) :-
     (
         member(SomeAccount, Accounts0),
         SomeAccount ^ from_address = no
     ->
-        get_notmuch_from_address(Notmuch, ResDefault, !IO),
+        get_notmuch_from_address(Config, MaybeDefault),
         (
-            ResDefault = ok(yes(Default))
+            MaybeDefault = yes(Default)
         ;
-            ResDefault = ok(no),
+            MaybeDefault = no,
             cons("could not derive default from_address from .notmuch-config",
                 !Errors),
-            Default = bad_mailbox("") % dummy
-        ;
-            ResDefault = error(Error),
-            cons(Error, !Errors),
             Default = bad_mailbox("") % dummy
         )
     ;
@@ -607,33 +619,29 @@ fill_default_mailbox(Notmuch, Accounts0, Accounts, !Errors, !IO) :-
     ),
     map(set_default_from_address(Default), Accounts0, Accounts).
 
-:- pred get_notmuch_from_address(command_prefix::in,
-    maybe_error(maybe(mailbox))::out, io::di, io::uo) is det.
+:- pred get_notmuch_from_address(notmuch_config::in, maybe(mailbox)::out)
+    is det.
 
-get_notmuch_from_address(Notmuch, Res, !IO) :-
-    get_notmuch_config0(Notmuch, "user.name", ResName, !IO),
-    (
-        ResName = ok(Name),
-        get_notmuch_config0(Notmuch, "user.primary_email", ResEmail, !IO),
-        (
-            ResEmail = ok(Email),
-            String = string.append_list([Name, " <", Email, ">"]),
-            (
-                parse_address(backslash_quote_all, String, Address),
-                Address = mailbox(Mailbox),
-                Mailbox = mailbox(_, _)
-            ->
-                Res = ok(yes(Mailbox))
-            ;
-                Res = ok(no)
-            )
-        ;
-            ResEmail = error(Error),
-            Res = error(Error)
-        )
+get_notmuch_from_address(Config, Res) :-
+    ( search(Config, "user", "name", Name0) ->
+        Name = Name0
     ;
-        ResName = error(Error),
-        Res = error(Error)
+        Name = ""
+    ),
+    ( search(Config, "user", "primary_email", Email0) ->
+        Email = Email0
+    ;
+        Email = ""
+    ),
+    String = string.append_list([Name, " <", Email, ">"]),
+    (
+        parse_address(backslash_quote_all, String, Address),
+        Address = mailbox(Mailbox),
+        Mailbox = mailbox(_, _)
+    ->
+        Res = yes(Mailbox)
+    ;
+        Res = no
     ).
 
 :- pred set_default_from_address(mailbox::in, account(maybe(mailbox))::in,
@@ -677,6 +685,20 @@ pick_default_account(Accounts, DefaultAccount, !Errors) :-
 
 is_default_account(Account) :-
     Account ^ default = yes.
+
+%-----------------------------------------------------------------------------%
+
+:- pred get_notmuch_search_exclude_tags(notmuch_config::in, set(tag)::out)
+    is det.
+
+get_notmuch_search_exclude_tags(Config, ExcludeTags) :-
+    ( search(Config, "search", "exclude_tags", Value) ->
+        Words = string.words_separator(unify(';'), Value),
+        Tags = list.map(func(Name) = tag(Name), Words),
+        ExcludeTags = set.from_list(Tags)
+    ;
+        ExcludeTags = set.init
+    ).
 
 %-----------------------------------------------------------------------------%
 
@@ -790,6 +812,11 @@ get_sendmail_command(Account, sendmail_read_recipients, Command) :-
 
 get_post_sendmail_action(Account, Action) :-
     Action = Account ^ post_sendmail.
+
+%-----------------------------------------------------------------------------%
+
+get_exclude_tags(Config, ExcludeTags) :-
+    ExcludeTags = Config ^ exclude_tags.
 
 %-----------------------------------------------------------------------------%
 
