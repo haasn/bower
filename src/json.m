@@ -5,6 +5,7 @@
 :- interface.
 
 :- import_module bool.
+:- import_module integer.
 :- import_module list.
 :- import_module map.
 :- import_module parsing_utils.
@@ -15,6 +16,7 @@
     --->    null
     ;       bool(bool)
     ;       int(int)
+    ;       integer(integer)        % only if too big for int()
     ;       float(float)
     ;       string(esc_string)
     ;       list(list(json))        % array
@@ -195,9 +197,15 @@ number(Src, Number, !PS) :-
         string.to_float(NumberString, Float),
         not is_nan_or_inf(Float),
         Number = float(Float)
-    else
-        string.to_int(NumberString, Int),
+    else if string.to_int(NumberString, Int) then
         Number = int(Int)
+    else if
+        % integer.from_string/2 was added after 14.01.
+        integer.from_string(NumberString) = Integer
+    then
+        Number = integer(Integer)
+    else
+        fail
     ),
     skip_ws(Src, unit, !PS).
 

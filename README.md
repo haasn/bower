@@ -20,7 +20,7 @@ require some work to work on other systems.
 
 At compile time:
 
-* Mercury compiler (11.07 or later, including release-of-the-day);
+* Mercury compiler (14.01 or later, including release-of-the-day);
   currently available at <http://dl.mercurylang.org/index.html>
 
 At run time:
@@ -136,6 +136,7 @@ The keys are:
     Enter           open thread
     l, ~            change search terms ("limit")
     =               refresh search results
+    z               toggle authors column
 
     /, ?            search for string within results
     n               skip to next search result
@@ -157,6 +158,8 @@ The keys are:
     L               reply to list
     R               recall postponed message
     @               add to address book
+
+    |               pipe thread IDs to command
 
     q               quit
 
@@ -210,6 +213,8 @@ This view pages through an entire thread.  The keys are:
     Z               toggle inline display of part / decrypt
     z, o            expand/collapse folded text
     y               verify signed part
+
+    |               pipe thread or message IDs to command
 
     i, q            return to index
     I               return to index, removing 'unread' tag on all messages

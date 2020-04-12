@@ -20,7 +20,6 @@
 
 :- import_module async.
 :- import_module crypto.
-:- import_module curs.
 :- import_module index_view.
 :- import_module notmuch_config.
 :- import_module prog_config.
@@ -28,6 +27,9 @@
 :- import_module search_term.
 :- import_module signal.
 :- import_module view_common.
+
+:- use_module curs.
+:- use_module curs_signal.
 
 %-----------------------------------------------------------------------------%
 
@@ -68,7 +70,8 @@ main(!IO) :-
     is cc_multi.
 
 main_2(Config, NotmuchConfig, Crypto, !IO) :-
-    % Install our SIGINT, SIGCHLD handlers.
+    curs_signal.install_suspend_handlers(!IO),
+    curs_signal.install_exit_handlers(!IO),
     signal.ignore_sigint(no, !IO),
     async.install_sigchld_handler(!IO),
     io.command_line_arguments(Args, !IO),

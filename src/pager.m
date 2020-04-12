@@ -9,8 +9,6 @@
 :- import_module maybe.
 
 :- import_module color.
-:- import_module curs.
-:- import_module curs.panel.
 :- import_module data.
 :- import_module prog_config.
 :- import_module screen.
@@ -31,7 +29,7 @@
 :- pred setup_pager(prog_config::in, setup_mode::in, int::in,
     list(message)::in, pager_info::out, io::di, io::uo) is det.
 
-:- pred setup_pager_for_staging(int::in, string::in,
+:- pred setup_pager_for_staging(prog_config::in, int::in, string::in,
     retain_pager_pos::in, pager_info::out) is det.
 
 :- type pager_action
@@ -103,8 +101,8 @@
 :- pred get_percent_visible(pager_info::in, int::in, message_id::in, int::out)
     is semidet.
 
-:- pred draw_pager_lines(pager_attrs::in, list(panel)::in, pager_info::in,
-    io::di, io::uo) is det.
+:- pred draw_pager_lines(screen::in, list(vpanel)::in, pager_attrs::in,
+    pager_info::in, io::di, io::uo) is det.
 
 %-----------------------------------------------------------------------------%
 %-----------------------------------------------------------------------------%
@@ -129,9 +127,12 @@
 :- import_module mime_type.
 :- import_module pager_text.
 :- import_module quote_arg.
+:- import_module sanitise.
 :- import_module size_util.
 :- import_module string_util.
 :- import_module time_util.
+
+:- use_module curs.
 
 %-----------------------------------------------------------------------------%
 
@@ -375,7 +376,9 @@ make_message_self_trees(Config, Cols, Message, NodeId, Trees, !Counter, !IO) :-
 add_header(StartMessage, Cols, Name, Value, !RevLines) :-
     % 2 extra columns for "Name: "
     RemainCols = max(0, Cols - string_wcwidth(Name) - 2),
-    get_spans_by_whitespace(header_value_string(Value), Spans),
+    ValueStr = header_value_string(Value),
+    make_presentable(ValueStr) = presentable_string(DisplayValue),
+    get_spans_by_whitespace(DisplayValue, Spans),
     fill_lines(RemainCols, Spans, Folded),
     (
         Folded = [],
@@ -442,7 +445,8 @@ make_part_tree_with_alts(Config, Cols, AltParts, Part, HandleUnsupported, Tree,
             Text = InlineText,
             Filtered = part_not_filtered
         ),
-        make_text_lines(Cols, Text, Lines0),
+        get_wrap_width(Config, Cols, WrapWidth),
+        make_text_lines(WrapWidth, Text, Lines0),
         list.map(wrap_text, Lines0) = Lines,
         fold_quote_blocks(Lines, TextTrees, !Counter),
         (
@@ -695,15 +699,12 @@ make_encapsulated_message_tree(Config, Cols, EncapMessage, Tree, !Counter, !IO)
     list(pager_line)::in, list(pager_line)::out) is det.
 
 add_encapsulated_header(Header, Value, RevLines0, RevLines) :-
-    (
-        Value = header_value(ValueString)
-    ;
-        Value = decoded_unstructured(ValueString)
-    ),
-    ( ValueString = "" ->
+    ValueStr = header_value_string(Value),
+    make_presentable(ValueStr) = presentable_string(DisplayValue),
+    ( DisplayValue = "" ->
         RevLines = RevLines0
     ;
-        Line = text(pager_text(0, Header ++ ": " ++ ValueString, 0, plain)),
+        Line = text(pager_text(0, Header ++ ": " ++ DisplayValue, 0, plain)),
         RevLines = [Line | RevLines0]
     ).
 
@@ -747,7 +748,8 @@ make_unsupported_part_tree(Config, Cols, PartNodeId, Part, HandleUnsupported,
             MaybeText, !IO),
         (
             MaybeText = ok(Text),
-            make_text_lines(Cols, Text, TextLines)
+            get_wrap_width(Config, Cols, WrapWidth),
+            make_text_lines(WrapWidth, Text, TextLines)
         ;
             MaybeText = error(Error),
             make_text_lines(Cols, "(" ++ Error ++ ")", TextLines)
@@ -783,8 +785,9 @@ wrap_text(Text) = text(Text).
 
 %-----------------------------------------------------------------------------%
 
-setup_pager_for_staging(Cols, Text, RetainPagerPos, Info) :-
-    make_text_lines(Cols, Text, Lines0),
+setup_pager_for_staging(Config, Cols, Text, RetainPagerPos, Info) :-
+    get_wrap_width(Config, Cols, WrapWidth),
+    make_text_lines(WrapWidth, Text, Lines0),
     Lines = wrap_texts(Lines0) ++ [
         message_separator,
         message_separator,
@@ -874,17 +877,17 @@ key_binding(KeyCode, Binding) :-
         char_binding(Char, Binding)
     ;
         KeyCode = code(Code),
-        ( Code = key_down ->
+        ( Code = curs.key_down ->
             Binding = scroll_down
-        ; Code = key_up ->
+        ; Code = curs.key_up ->
             Binding = scroll_up
-        ; Code = key_pagedown ->
+        ; Code = curs.key_pagedown ->
             Binding = page_down
-        ; Code = key_pageup ->
+        ; Code = curs.key_pageup ->
             Binding = page_up
-        ; Code = key_home ->
+        ; Code = curs.key_home ->
             Binding = home
-        ; Code = key_end ->
+        ; Code = curs.key_end ->
             Binding = end
         ;
             fail
@@ -1590,20 +1593,21 @@ get_percent_visible(Info, NumPagerRows, MessageId, Percent) :-
 
 %-----------------------------------------------------------------------------%
 
-draw_pager_lines(Attrs, Panels, Info, !IO) :-
+draw_pager_lines(Screen, Panels, Attrs, Info, !IO) :-
     Scrollable = Info ^ p_scrollable,
-    scrollable.draw(draw_id_pager_line(Attrs), Panels, Scrollable, !IO).
+    scrollable.draw(draw_id_pager_line(Attrs), Screen, Panels, Scrollable,
+        !IO).
 
-:- pred draw_id_pager_line(pager_attrs::in, panel::in, id_pager_line::in,
-    int::in, bool::in, io::di, io::uo) is det.
+:- pred draw_id_pager_line(pager_attrs::in, screen::in, vpanel::in,
+    id_pager_line::in, int::in, bool::in, io::di, io::uo) is det.
 
-draw_id_pager_line(Attrs, Panel, _Id - Line, _LineNr, IsCursor, !IO) :-
-    draw_pager_line(Attrs, Panel, Line, IsCursor, !IO).
+draw_id_pager_line(Attrs, Screen, Panel, _Id - Line, _LineNr, IsCursor, !IO) :-
+    draw_pager_line(Attrs, Screen, Panel, Line, IsCursor, !IO).
 
-:- pred draw_pager_line(pager_attrs::in, panel::in, pager_line::in, bool::in,
-    io::di, io::uo) is det.
+:- pred draw_pager_line(pager_attrs::in, screen::in, vpanel::in,
+    pager_line::in, bool::in, io::di, io::uo) is det.
 
-draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
+draw_pager_line(Attrs, Screen, Panel, Line, IsCursor, !IO) :-
     GAttrs = Attrs ^ p_generic,
     (
         (
@@ -1612,59 +1616,64 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
         ;
             Line = subseq_message_header(Continue, Name, Value)
         ),
-        attr(Panel, GAttrs ^ field_name, !IO),
+        attr(Screen, Panel, GAttrs ^ field_name, !IO),
         (
             Continue = no,
-            draw(Panel, Name, !IO),
-            draw(Panel, ": ", !IO)
+            draw(Screen, Panel, Name, !IO),
+            draw(Screen, Panel, ": ", !IO)
         ;
             Continue = yes,
-            getyx(Panel, Y, X, !IO),
-            move(Panel, Y, X + string_wcwidth(Name) + 2, !IO)
+            getyx(Screen, Panel, Y, X, !IO),
+            move(Screen, Panel, Y, X + string_wcwidth(Name) + 2, !IO)
         ),
         BodyAttr = GAttrs ^ field_body,
         (
             IsCursor = yes,
-            Highlight = reverse
+            Highlight = curs.reverse
         ;
             IsCursor = no,
             ( Name = "Subject" ->
-                Highlight = bold
+                Highlight = curs.bold
             ;
-                Highlight = normal
+                Highlight = curs.normal
             )
         ),
-        draw(Panel, BodyAttr + Highlight, Value, !IO)
+        draw(Screen, Panel, curs.(BodyAttr + Highlight), Value, !IO)
     ;
         Line = text(pager_text(QuoteLevel, Text, QuoteMarkerEnd, TextType)),
         Attr0 = quote_level_to_attr(Attrs, QuoteLevel),
         (
             IsCursor = yes,
-            Attr1 = reverse
+            Attr1 = curs.reverse
         ;
             IsCursor = no,
-            Attr1 = normal
+            Attr1 = curs.normal
         ),
         (
             TextType = plain,
-            draw(Panel, Attr0 + Attr1, Text, !IO)
+            draw(Screen, Panel, curs.(Attr0 + Attr1), Text, !IO)
         ;
             TextType = diff(DiffLine),
             DiffAttr = diff_line_to_attr(Attrs, DiffLine),
             ( QuoteMarkerEnd = 0 ->
-                draw(Panel, DiffAttr + Attr1, Text, !IO)
+                draw(Screen, Panel, curs.(DiffAttr + Attr1), Text, !IO)
             ;
                 End = string.length(Text),
-                draw(Panel, Attr0 + Attr1, Text, 0, QuoteMarkerEnd, !IO),
-                draw(Panel, DiffAttr + Attr1, Text, QuoteMarkerEnd, End, !IO)
+                draw(Screen, Panel, curs.(Attr0 + Attr1),
+                    Text, 0, QuoteMarkerEnd, !IO),
+                draw(Screen, Panel, curs.(DiffAttr + Attr1),
+                    Text, QuoteMarkerEnd, End, !IO)
             )
         ;
             TextType = url(UrlStart, UrlEnd),
             UrlAttr = Attrs ^ p_url,
             End = string.length(Text),
-            draw(Panel, Attr0 + Attr1, Text, 0, UrlStart, !IO),
-            draw(Panel, UrlAttr + Attr1, Text, UrlStart, UrlEnd, !IO),
-            draw(Panel, Attr0 + Attr1, Text, UrlEnd, End, !IO)
+            draw(Screen, Panel, curs.(Attr0 + Attr1),
+                Text, 0, UrlStart, !IO),
+            draw(Screen, Panel, curs.(UrlAttr + Attr1),
+                Text, UrlStart, UrlEnd, !IO),
+            draw(Screen, Panel, curs.(Attr0 + Attr1),
+                Text, UrlEnd, End, !IO)
         )
     ;
         Line = part_head(Part, HiddenParts, Expanded, Importance),
@@ -1680,32 +1689,32 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
         ),
         (
             IsCursor = yes,
-            Attr = Attr0 + reverse
+            Attr = curs.(Attr0 + curs.reverse)
         ;
             IsCursor = no,
             Attr = Attr0
         ),
-        draw(Panel, Attr, "[-- ", !IO),
-        draw(Panel, mime_type.to_string(ContentType), !IO),
+        draw(Screen, Panel, Attr, "[-- ", !IO),
+        draw(Screen, Panel, mime_type.to_string(ContentType), !IO),
         (
             MaybeFilename = yes(filename(Filename)),
-            draw(Panel, "; ", !IO),
-            draw(Panel, Filename, !IO)
+            draw(Screen, Panel, "; ", !IO),
+            draw(Screen, Panel, Filename, !IO)
         ;
             MaybeFilename = no
         ),
         /*
         (
             MaybeContentDisposition = yes(content_disposition(Disposition)),
-            draw(Panel, "; ", !IO),
-            draw(Panel, Disposition, !IO)
+            draw(Screen, Panel, "; ", !IO),
+            draw(Screen, Panel, Disposition, !IO)
         ;
             MaybeContentDisposition = no
         ),
         (
             MaybeContentCharset = yes(content_charset(Charset)),
-            draw(Panel, "; charset=", !IO),
-            draw(Panel, Charset, !IO)
+            draw(Screen, Panel, "; charset=", !IO),
+            draw(Screen, Panel, Charset, !IO)
         ;
             MaybeContentCharset = no
         ),
@@ -1717,16 +1726,16 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
             ;
                 DecodedLength = Length
             ),
-            draw(Panel, " (", !IO),
-            draw(Panel, format_approx_length(DecodedLength), !IO),
-            draw(Panel, ")", !IO)
+            draw(Screen, Panel, " (", !IO),
+            draw(Screen, Panel, format_approx_length(DecodedLength), !IO),
+            draw(Screen, Panel, ")", !IO)
         ;
             MaybeContentLength = no
         ),
-        draw(Panel, " --]", !IO),
+        draw(Screen, Panel, " --]", !IO),
         ( make_part_message(Part, HiddenParts, Expanded, Message) ->
-            attr(Panel, Attrs ^ p_part_message, !IO),
-            draw2(Panel, "  ", Message, !IO)
+            attr(Screen, Panel, Attrs ^ p_part_message, !IO),
+            draw2(Screen, Panel, "  ", Message, !IO)
         ;
             true
         )
@@ -1734,12 +1743,12 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
         Line = fold_marker(_, _),
         (
             IsCursor = yes,
-            Attr = Attrs ^ p_fold + reverse
+            Attr = curs.(Attrs ^ p_fold + curs.reverse)
         ;
             IsCursor = no,
             Attr = Attrs ^ p_fold
         ),
-        draw(Panel, Attr, "...", !IO)
+        draw(Screen, Panel, Attr, "...", !IO)
     ;
         Line = signature(signature(Status, Errors)),
         BodyAttr = GAttrs ^ field_body,
@@ -1747,37 +1756,37 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
         BadAttr = GAttrs ^ bad_key,
         (
             Status = none,
-            draw(Panel, BadAttr, " ─• No signature ", !IO)
+            draw(Screen, Panel, BadAttr, " ─• No signature ", !IO)
         ;
             Status = good(MaybeFingerprint, _MaybeCreated, MaybeExpires,
                 MaybeUserId),
-            draw(Panel, GoodAttr, " ─• Good signature ", !IO),
+            draw(Screen, Panel, GoodAttr, " ─• Good signature ", !IO),
             (
                 MaybeUserId = yes(UserId),
-                draw(Panel, BodyAttr, lstrip(UserId), !IO),
+                draw(Screen, Panel, BodyAttr, lstrip(UserId), !IO),
                 (
                     MaybeFingerprint = yes(Fingerprint),
-                    draw(Panel, BodyAttr, ", fpr ", !IO),
-                    draw(Panel, BodyAttr, Fingerprint, !IO)
+                    draw(Screen, Panel, BodyAttr, ", fpr ", !IO),
+                    draw(Screen, Panel, BodyAttr, Fingerprint, !IO)
                 ;
                     MaybeFingerprint = no
                 )
             ;
                 MaybeUserId = no,
                 MaybeFingerprint = yes(Fingerprint),
-                draw(Panel, BodyAttr, "fingerprint ", !IO),
-                draw(Panel, BodyAttr, Fingerprint, !IO)
+                draw(Screen, Panel, BodyAttr, "fingerprint ", !IO),
+                draw(Screen, Panel, BodyAttr, Fingerprint, !IO)
             ;
                 MaybeUserId = no,
                 MaybeFingerprint = no,
-                draw(Panel, BodyAttr, "(no user id)", !IO)
+                draw(Screen, Panel, BodyAttr, "(no user id)", !IO)
             ),
             % Not really tested; don't know when it occurs.
             (
                 MaybeExpires = yes(Expires),
                 localtime(Expires, TM, !IO),
-                draw(Panel, BodyAttr, "; expires ", !IO),
-                draw(Panel, BodyAttr, asctime(TM), !IO)
+                draw(Screen, Panel, BodyAttr, "; expires ", !IO),
+                draw(Screen, Panel, BodyAttr, asctime(TM), !IO)
             ;
                 MaybeExpires = no
             )
@@ -1793,28 +1802,29 @@ draw_pager_line(Attrs, Panel, Line, IsCursor, !IO) :-
                 BadStatus = unknown,
                 BadMessage = " ─• Problem verifying signature "
             ),
-            draw(Panel, BadAttr, BadMessage, !IO),
+            draw(Screen, Panel, BadAttr, BadMessage, !IO),
             (
                 MaybeKeyId = yes(KeyId),
-                draw(Panel, BodyAttr, "key id ", !IO),
-                draw(Panel, BodyAttr, KeyId, !IO)
+                draw(Screen, Panel, BodyAttr, "key id ", !IO),
+                draw(Screen, Panel, BodyAttr, KeyId, !IO)
             ;
                 MaybeKeyId = no,
-                draw(Panel, BodyAttr, "(no key id)", !IO)
+                draw(Screen, Panel, BodyAttr, "(no key id)", !IO)
             )
         ),
         ( Errors > 0 ->
-            draw(Panel, BodyAttr, format(" (errors: %d)", [i(Errors)]), !IO)
+            draw(Screen, Panel, BodyAttr, format(" (errors: %d)", [i(Errors)]),
+                !IO)
         ;
             true
         )
     ;
         Line = message_separator,
         Attr = Attrs ^ p_separator,
-        draw(Panel, Attr, "~", !IO)
+        draw(Screen, Panel, Attr, "~", !IO)
     ).
 
-:- func quote_level_to_attr(pager_attrs, quote_level) = attr.
+:- func quote_level_to_attr(pager_attrs, quote_level) = curs.attr.
 
 quote_level_to_attr(Attrs, QuoteLevel) = Attr :-
     ( QuoteLevel = 0 ->
@@ -1825,7 +1835,7 @@ quote_level_to_attr(Attrs, QuoteLevel) = Attr :-
         Attr = Attrs ^ p_quote_even
     ).
 
-:- func diff_line_to_attr(pager_attrs, diff_line) = attr.
+:- func diff_line_to_attr(pager_attrs, diff_line) = curs.attr.
 
 diff_line_to_attr(Attrs, diff_common) = Attrs ^ p_diff_common.
 diff_line_to_attr(Attrs, diff_add) = Attrs ^ p_diff_add.

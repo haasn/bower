@@ -28,12 +28,13 @@
 
 :- import_module callout.
 :- import_module color.
-:- import_module curs.
-:- import_module curs.panel.
 :- import_module maildir.
+:- import_module sanitise.
 :- import_module scrollable.
 :- import_module tags.
 :- import_module time_util.
+
+:- use_module curs.
 
 %-----------------------------------------------------------------------------%
 
@@ -47,8 +48,8 @@
     --->    recall_line(
                 r_message       :: message_for_recall,
                 r_reldate       :: string,
-                r_to            :: header_value,
-                r_subject       :: header_value,
+                r_to            :: presentable_string,
+                r_subject       :: presentable_string,
                 r_tags          :: set(tag)
             ).
 
@@ -94,12 +95,13 @@ make_recall_line(Config, Nowish, MessageId, MaybeLine, !IO) :-
     (
         Result = ok(Message),
         Message = message_for_recall(_Id, Timestamp, Headers, Tags),
-        To = Headers ^ h_to,
-        Subject = Headers ^ h_subject,
+        To = header_value_string(Headers ^ h_to),
+        Subject = header_value_string(Headers ^ h_subject),
         localtime(Timestamp, TM, !IO),
         Shorter = no,
         make_reldate(Nowish, TM, Shorter, RelDate),
-        Line = recall_line(Message, RelDate, To, Subject, Tags),
+        Line = recall_line(Message, RelDate, make_presentable(To),
+            make_presentable(Subject), Tags),
         MaybeLine = yes(Line)
     ;
         Result = error(Error),
@@ -114,18 +116,18 @@ make_recall_line(Config, Nowish, MessageId, MaybeLine, !IO) :-
 recall_screen_loop(Screen, MaybeSelected, !Info, !IO) :-
     draw_recall(Screen, !.Info, !IO),
     draw_status_bar(Screen, !IO),
-    panel.update_panels(!IO),
+    update_panels(Screen, !IO),
     get_keycode_blocking(KeyCode, !IO),
     (
         ( KeyCode = char('j')
-        ; KeyCode = code(key_down)
+        ; KeyCode = code(curs.key_down)
         )
     ->
         move_cursor(Screen, 1, !Info, !IO),
         recall_screen_loop(Screen, MaybeSelected, !Info, !IO)
     ;
         ( KeyCode = char('k')
-        ; KeyCode = code(key_up)
+        ; KeyCode = code(curs.key_up)
         )
     ->
         move_cursor(Screen, -1, !Info, !IO),
@@ -150,10 +152,10 @@ recall_screen_loop(Screen, MaybeSelected, !Info, !IO) :-
             recall_screen_loop(Screen, MaybeSelected, !Info, !IO)
         )
     ;
-        KeyCode = code(key_resize)
+        KeyCode = code(curs.key_resize)
     ->
-        replace_screen_for_resize(Screen, NewScreen, !IO),
-        recall_screen_loop(NewScreen, MaybeSelected, !Info, !IO)
+        recreate_screen_for_resize(Screen, !IO),
+        recall_screen_loop(Screen, MaybeSelected, !Info, !IO)
     ;
         recall_screen_loop(Screen, MaybeSelected, !Info, !IO)
     ).
@@ -163,7 +165,7 @@ recall_screen_loop(Screen, MaybeSelected, !Info, !IO) :-
 
 move_cursor(Screen, Delta, !Info, !IO) :-
     !.Info ^ r_scrollable = Scrollable0,
-    get_main_rows(Screen, NumRows),
+    get_main_rows(Screen, NumRows, !IO),
     scrollable.move_cursor(NumRows, Delta, HitLimit, Scrollable0, Scrollable),
     !Info ^ r_scrollable := Scrollable,
     (
@@ -243,16 +245,17 @@ delete_draft(Screen, !Info, !IO) :-
 :- pred draw_recall(screen::in, recall_info::in, io::di, io::uo) is det.
 
 draw_recall(Screen, Info, !IO) :-
-    get_main_panels(Screen, Panels),
+    get_main_panels(Screen, Panels, !IO),
     Info = recall_info(Config, Scrollable),
     Attrs = generic_attrs(Config),
-    scrollable.draw(draw_recall_line(Attrs), Panels, Scrollable, !IO).
+    scrollable.draw(draw_recall_line(Attrs), Screen, Panels, Scrollable, !IO).
 
-:- pred draw_recall_line(generic_attrs::in, panel::in, recall_line::in,
-    int::in, bool::in, io::di, io::uo) is det.
+:- pred draw_recall_line(generic_attrs::in, screen::in, vpanel::in,
+    recall_line::in, int::in, bool::in, io::di, io::uo) is det.
 
-draw_recall_line(Attrs, Panel, Line, _LineNr, IsCursor, !IO) :-
-    Line = recall_line(_FileName, RelDate, To, Subject, Tags),
+draw_recall_line(Attrs, Screen, Panel, Line, _LineNr, IsCursor, !IO) :-
+    Line = recall_line(_FileName, RelDate, presentable_string(To),
+        presentable_string(Subject), Tags),
     (
         IsCursor = yes,
         RelDateAttr = Attrs ^ current
@@ -260,33 +263,33 @@ draw_recall_line(Attrs, Panel, Line, _LineNr, IsCursor, !IO) :-
         IsCursor = no,
         RelDateAttr = Attrs ^ relative_date
     ),
-    draw_fixed(Panel, RelDateAttr, 13, RelDate, ' ', !IO),
+    draw_fixed(Screen, Panel, RelDateAttr, 13, RelDate, ' ', !IO),
 
     NameAttr = Attrs ^ field_name,
     BodyAttr = Attrs ^ field_body,
-    mattr_draw(Panel, unless(IsCursor, NameAttr), "To: ", !IO),
-    mattr_draw_fixed(Panel, unless(IsCursor, BodyAttr),
-        25, header_value_string(To), ' ', !IO),
-    mattr_draw(Panel, unless(IsCursor, NameAttr), " Subject: ", !IO),
-    mattr_draw(Panel, unless(IsCursor, BodyAttr), header_value_string(Subject),
+    mattr_draw(Screen, Panel, unless(IsCursor, NameAttr), "To: ", !IO),
+    mattr_draw_fixed(Screen, Panel, unless(IsCursor, BodyAttr), 25, To, ' ',
         !IO),
-    attr_set(Panel, Attrs ^ other_tag, !IO),
-    set.fold(draw_display_tag(Panel), Tags, !IO).
+    mattr_draw(Screen, Panel, unless(IsCursor, NameAttr), " Subject: ", !IO),
+    mattr_draw(Screen, Panel, unless(IsCursor, BodyAttr), Subject, !IO),
+    attr(Screen, Panel, Attrs ^ other_tag, !IO),
+    set.fold(draw_display_tag(Screen, Panel), Tags, !IO).
 
-:- pred draw_display_tag(panel::in, tag::in, io::di, io::uo) is det.
+:- pred draw_display_tag(screen::in, vpanel::in, tag::in, io::di, io::uo)
+    is det.
 
-draw_display_tag(Panel, Tag, !IO) :-
+draw_display_tag(Screen, Panel, Tag, !IO) :-
     (
         Tag \= draft_tag,
         display_tag(Tag)
     ->
         Tag = tag(TagName),
-        draw2(Panel, " ", TagName, !IO)
+        draw2(Screen, Panel, " ", TagName, !IO)
     ;
         true
     ).
 
-:- func unless(bool, attr) = maybe(attr).
+:- func unless(bool, curs.attr) = maybe(curs.attr).
 
 unless(no, X) = yes(X).
 unless(yes, _) = no.

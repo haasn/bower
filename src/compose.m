@@ -75,8 +75,6 @@
 :- import_module call_system.
 :- import_module callout.
 :- import_module color.
-:- import_module curs.
-:- import_module curs.panel.
 :- import_module detect_mime_type.
 :- import_module forward.
 :- import_module gpgme.
@@ -101,6 +99,8 @@
 :- import_module tags.
 :- import_module time_util.
 :- import_module write_message.
+
+:- use_module curs.
 
 :- include_module compose.crypto.
 :- import_module compose.crypto.
@@ -146,7 +146,7 @@
 
 :- type attachment_content
     --->    text(string)
-    ;       binary_base64(string).
+    ;       base64_encoded(string).
 
 :- type staging_screen_action
     --->    continue
@@ -529,8 +529,8 @@ create_edit_stage_2(Config, Screen, Headers0, Text0, Attachments,
                 ResParse = ok(Headers1 - Text),
                 io.remove_file(Filename, _, !IO),
                 update_references(Headers0, Headers1, Headers2),
-                enter_staging(Config, Screen, Headers2, Text, Attachments,
-                    MaybeOldDraft, Transition, !CryptoInfo, !IO)
+                reenter_staging_screen(Config, Screen, Headers2, Text,
+                    Attachments, MaybeOldDraft, Transition, !CryptoInfo, !IO)
             ;
                 ResParse = error(Error),
                 io.error_message(Error, Msg),
@@ -601,12 +601,13 @@ update_references(Headers0, !Headers) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred enter_staging(prog_config::in, screen::in, headers::in, string::in,
-    list(attachment)::in, maybe(message_id)::in, screen_transition(sent)::out,
-    crypto_info::in, crypto_info::out, io::di, io::uo) is det.
+:- pred reenter_staging_screen(prog_config::in, screen::in, headers::in,
+    string::in, list(attachment)::in, maybe(message_id)::in,
+    screen_transition(sent)::out, crypto_info::in, crypto_info::out,
+    io::di, io::uo) is det.
 
-enter_staging(Config, Screen, Headers0, Text, Attachments, MaybeOldDraft,
-        Transition, !CryptoInfo, !IO) :-
+reenter_staging_screen(Config, Screen, Headers0, Text, Attachments,
+        MaybeOldDraft, Transition, !CryptoInfo, !IO) :-
     parse_and_expand_headers(Config, Headers0, Headers, Parsed, !IO),
     get_some_matching_account(Config, Parsed ^ ph_from, MaybeAccount),
     maintain_encrypt_keys(Parsed, !CryptoInfo, !IO),
@@ -615,8 +616,9 @@ enter_staging(Config, Screen, Headers0, Text, Attachments, MaybeOldDraft,
     StagingInfo = staging_info(Config, MaybeAccount, Headers, Parsed, Text,
         MaybeOldDraft, init_history),
     AttachInfo = scrollable.init_with_cursor(Attachments),
-    get_cols(Screen, Cols),
-    setup_pager_for_staging(Cols, Text, new_pager, PagerInfo),
+    get_cols(Screen, Cols, !IO),
+    setup_pager_for_staging(Config, Cols, Text, new_pager, PagerInfo),
+    update_message(Screen, clear_message, !IO),
     staging_screen(Screen, StagingInfo, AttachInfo, PagerInfo, Transition,
         !CryptoInfo, !IO).
 
@@ -727,17 +729,18 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
     Attrs = compose_attrs(Config),
     PagerAttrs = pager_attrs(Config),
 
-    split_panels(Screen, HeaderPanels, AttachmentPanels, MaybeSepPanel,
+    get_main_panels(Screen, MainPanels, !IO),
+    split_panels(MainPanels, HeaderPanels, AttachmentPanels, MaybeSepPanel,
         PagerPanels),
-    draw_header_lines(HeaderPanels, Attrs, Headers, ParsedHeaders,
+    draw_header_lines(Screen, HeaderPanels, Attrs, Headers, ParsedHeaders,
         MaybeAccount, !.CryptoInfo, !IO),
-    scrollable.draw(draw_attachment_line(Attrs), AttachmentPanels,
+    scrollable.draw(draw_attachment_line(Attrs), Screen, AttachmentPanels,
         !.AttachInfo, !IO),
-    draw_attachments_label(Attrs, AttachmentPanels, !IO),
-    draw_sep_bar(Attrs, Screen, MaybeSepPanel, !IO),
-    draw_pager_lines(PagerAttrs, PagerPanels, !.PagerInfo, !IO),
+    draw_attachments_label(Screen, AttachmentPanels, Attrs, !IO),
+    draw_sep_bar(Screen, MaybeSepPanel, Attrs, !IO),
+    draw_pager_lines(Screen, PagerPanels, PagerAttrs, !.PagerInfo, !IO),
     draw_staging_bar(Attrs, Screen, !.StagingInfo, !IO),
-    panel.update_panels(!IO),
+    update_panels(Screen, !IO),
 
     NumAttachmentRows = list.length(AttachmentPanels),
     NumPagerRows = list.length(PagerPanels),
@@ -770,14 +773,14 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
         Action = continue
     ;
         ( KeyCode = char('j')
-        ; KeyCode = code(key_down)
+        ; KeyCode = code(curs.key_down)
         )
     ->
         scroll_attachments(Screen, NumAttachmentRows, 1, !AttachInfo, !IO),
         Action = continue
     ;
         ( KeyCode = char('k')
-        ; KeyCode = code(key_up)
+        ; KeyCode = code(curs.key_up)
         )
     ->
         scroll_attachments(Screen, NumAttachmentRows, -1, !AttachInfo, !IO),
@@ -857,7 +860,7 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
             Message = set_info("Mail not sent."),
             Action = leave(not_sent, Message)
         )
-    ; KeyCode = code(key_resize) ->
+    ; KeyCode = code(curs.key_resize) ->
         Action = resize
     ;
         pager_input(NumPagerRows, KeyCode, _Action, MessageUpdate, !PagerInfo),
@@ -870,9 +873,8 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
             Transition, !CryptoInfo, !IO)
     ;
         Action = resize,
-        resize_staging_screen(Screen, NewScreen, !.StagingInfo, !PagerInfo,
-            !IO),
-        staging_screen(NewScreen, !.StagingInfo, !.AttachInfo, !.PagerInfo,
+        resize_staging_screen(Screen, !.StagingInfo, !PagerInfo, !IO),
+        staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo,
             Transition, !CryptoInfo, !IO)
     ;
         Action = edit,
@@ -885,18 +887,19 @@ staging_screen(Screen, !.StagingInfo, !.AttachInfo, !.PagerInfo, Transition,
         Transition = screen_transition(Sent, TransitionMessage)
     ).
 
-:- pred resize_staging_screen(screen::in, screen::out, staging_info::in,
+:- pred resize_staging_screen(screen::in, staging_info::in,
     pager_info::in, pager_info::out, io::di, io::uo) is det.
 
-resize_staging_screen(Screen0, Screen, StagingInfo, PagerInfo0, PagerInfo,
-        !IO) :-
-    replace_screen_for_resize(Screen0, Screen, !IO),
-    get_cols(Screen, Cols),
-    split_panels(Screen, _HeaderPanels, _AttachmentPanels, _MaybeSepPanel,
+resize_staging_screen(Screen, StagingInfo, PagerInfo0, PagerInfo, !IO) :-
+    recreate_screen_for_resize(Screen, !IO),
+    get_cols(Screen, Cols, !IO),
+    get_main_panels(Screen, MainPanels, !IO),
+    split_panels(MainPanels, _HeaderPanels, _AttachmentPanels, _MaybeSepPanel,
         PagerPanels),
     NumPagerRows = list.length(PagerPanels),
+    Config = StagingInfo ^ si_config,
     Text = StagingInfo ^ si_text,
-    setup_pager_for_staging(Cols, Text,
+    setup_pager_for_staging(Config, Cols, Text,
         retain_pager_pos(PagerInfo0, NumPagerRows), PagerInfo).
 
 %-----------------------------------------------------------------------------%
@@ -1119,15 +1122,12 @@ do_attach_file_2(FileName, NumRows, MessageUpdate, !AttachInfo, !IO) :-
         ;
             BaseName = FileName
         ),
-        ( Charset = "binary" ->
-            do_attach_binary_file(FileName, BaseName, Type, NumRows,
-                MessageUpdate, !AttachInfo, !IO)
-        ; acceptable_charset(Charset) ->
+        ( acceptable_charset(Charset) ->
             do_attach_text_file(FileName, BaseName, Type, NumRows,
                 MessageUpdate, !AttachInfo, !IO)
         ;
-            MessageUpdate = set_warning(
-                "Only ASCII and UTF-8 text files supported yet.")
+            do_attach_file_with_base64_encoding(FileName, BaseName, Type,
+                NumRows, MessageUpdate, !AttachInfo, !IO)
         )
     ;
         ResDetect = error(Error),
@@ -1173,19 +1173,19 @@ do_attach_text_file(FileName, BaseName, Type, NumRows, MessageUpdate,
         MessageUpdate = set_warning(Msg)
     ).
 
-:- pred do_attach_binary_file(string::in, string::in, mime_type::in, int::in,
-    message_update::out, attach_info::in, attach_info::out, io::di, io::uo)
-    is det.
+:- pred do_attach_file_with_base64_encoding(string::in, string::in,
+    mime_type::in, int::in, message_update::out,
+    attach_info::in, attach_info::out, io::di, io::uo) is det.
 
-do_attach_binary_file(FileName, BaseName, Type, NumRows, MessageUpdate,
-        !AttachInfo, !IO) :-
+do_attach_file_with_base64_encoding(FileName, BaseName, Type, NumRows,
+        MessageUpdate, !AttachInfo, !IO) :-
     make_quoted_command(base64_command, [FileName],
         redirect_input("/dev/null"), no_redirect, Command),
     call_system_capture_stdout(Command, no, CallRes, !IO),
     (
         CallRes = ok(Content),
         string.length(Content, Size),
-        NewAttachment = new_attachment(Type, binary_base64(Content), BaseName,
+        NewAttachment = new_attachment(Type, base64_encoded(Content), BaseName,
             Size),
         append_attachment(NewAttachment, NumRows, !AttachInfo),
         MessageUpdate = clear_message
@@ -1274,12 +1274,11 @@ accept_media_type(String, MimeType) :-
 
 %-----------------------------------------------------------------------------%
 
-:- pred split_panels(screen::in, list(panel)::out, list(panel)::out,
-    maybe(panel)::out, list(panel)::out) is det.
+:- pred split_panels(list(vpanel)::in, list(vpanel)::out, list(vpanel)::out,
+    maybe(vpanel)::out, list(vpanel)::out) is det.
 
-split_panels(Screen, HeaderPanels, AttachmentPanels, MaybeSepPanel,
+split_panels(Panels0, HeaderPanels, AttachmentPanels, MaybeSepPanel,
         PagerPanels) :-
-    get_main_panels(Screen, Panels0),
     list.split_upto(7, Panels0, HeaderPanels, Panels1),
     list.split_upto(3, Panels1, AttachmentPanels, Panels2),
     (
@@ -1291,66 +1290,68 @@ split_panels(Screen, HeaderPanels, AttachmentPanels, MaybeSepPanel,
         PagerPanels = []
     ).
 
-:- pred draw_header_lines(list(panel)::in, compose_attrs::in,
+:- pred draw_header_lines(screen::in, list(vpanel)::in, compose_attrs::in,
     headers::in, parsed_headers::in, maybe(account)::in, crypto_info::in,
     io::di, io::uo) is det.
 
-draw_header_lines(!.Panels, Attrs, Headers, Parsed, Account, CryptoInfo, !IO)
-        :-
+draw_header_lines(Screen, !.Panels, Attrs, Headers, Parsed, Account,
+        CryptoInfo, !IO) :-
     DrawFrom = draw_addresses_and_account(Attrs, show_crypto(yes, yes),
         CryptoInfo, Account),
     DrawRecv = draw_addresses(Attrs, show_crypto(yes, no), CryptoInfo),
     DrawSubj = draw_unstruct(Attrs),
     DrawRepl = draw_addresses(Attrs, show_crypto(no, no), CryptoInfo),
-    hdr(!Panels, Attrs, DrawFrom, "    From", Parsed ^ ph_from, !IO),
-    hdr(!Panels, Attrs, DrawRecv, "      To", Parsed ^ ph_to, !IO),
-    hdr(!Panels, Attrs, DrawRecv, "      Cc", Parsed ^ ph_cc, !IO),
-    hdr(!Panels, Attrs, DrawRecv, "     Bcc", Parsed ^ ph_bcc, !IO),
-    hdr(!Panels, Attrs, DrawSubj, " Subject", Headers ^ h_subject, !IO),
-    hdr(!Panels, Attrs, DrawRepl, "Reply-To", Parsed ^ ph_replyto, !IO),
+    hdr(Screen, !Panels, Attrs, DrawFrom, "    From", Parsed ^ ph_from, !IO),
+    hdr(Screen, !Panels, Attrs, DrawRecv, "      To", Parsed ^ ph_to, !IO),
+    hdr(Screen, !Panels, Attrs, DrawRecv, "      Cc", Parsed ^ ph_cc, !IO),
+    hdr(Screen, !Panels, Attrs, DrawRecv, "     Bcc", Parsed ^ ph_bcc, !IO),
+    hdr(Screen, !Panels, Attrs, DrawSubj, " Subject", Headers ^ h_subject, !IO),
+    hdr(Screen, !Panels, Attrs, DrawRepl, "Reply-To", Parsed ^ ph_replyto, !IO),
     (
         !.Panels = []
     ;
         !.Panels = [CryptoPanel | _],
-        draw_crypto_line(Attrs, CryptoPanel, CryptoInfo, !IO)
+        draw_crypto_line(Attrs, Screen, CryptoPanel, CryptoInfo, !IO)
     ).
 
-:- pred hdr(list(panel), list(panel), compose_attrs,
-    pred(panel, T, io, io), string, T, io, io).
-:- mode hdr(in, out, in,
-    pred(in, in, di, uo) is det, in, in, di, uo) is det.
+:- pred hdr(screen, list(vpanel), list(vpanel), compose_attrs,
+    pred(screen, vpanel, T, io, io), string, T, io, io).
+:- mode hdr(in, in, out, in,
+    pred(in, in, in, di, uo) is det, in, in, di, uo) is det.
 
-hdr(Panels0, Panels, Attrs, DrawValue, FieldName, Value, !IO) :-
+hdr(Screen, Panels0, Panels, Attrs, DrawValue, FieldName, Value, !IO) :-
     (
         Panels0 = [],
         Panels = []
     ;
         Panels0 = [Panel | Panels],
-        panel.erase(Panel, !IO),
-        draw(Panel, Attrs ^ c_generic ^ field_name, FieldName, !IO),
-        draw(Panel, ": ", !IO),
-        DrawValue(Panel, Value, !IO)
+        erase(Screen, Panel, !IO),
+        draw(Screen, Panel, Attrs ^ c_generic ^ field_name, FieldName, !IO),
+        draw(Screen, Panel, ": ", !IO),
+        DrawValue(Screen, Panel, Value, !IO)
     ).
 
-:- pred draw_unstruct(compose_attrs::in, panel::in, header_value::in,
-    io::di, io::uo) is det.
+:- pred draw_unstruct(compose_attrs::in, screen::in, vpanel::in,
+    header_value::in, io::di, io::uo) is det.
 
-draw_unstruct(Attrs, Panel, Value, !IO) :-
+draw_unstruct(Attrs, Screen, Panel, Value, !IO) :-
     String = header_value_string(Value),
-    draw(Panel, Attrs ^ c_generic ^ field_body, String, !IO).
+    draw(Screen, Panel, Attrs ^ c_generic ^ field_body, String, !IO).
 
-:- pred draw_list(pred(panel, T, io, io), panel, attr, list(T), io, io).
-:- mode draw_list(pred(in, in, di, uo) is det, in, in, in, di, uo) is det.
+:- pred draw_list(pred(screen, vpanel, T, io, io),
+    screen, vpanel, curs.attr, list(T), io, io).
+:- mode draw_list(pred(in, in, in, di, uo) is det,
+    in, in, in, in, di, uo) is det.
 
-draw_list(_Pred, _Panel, _Attr, [], !IO).
-draw_list(Pred, Panel, Attr, [H | T], !IO) :-
-    Pred(Panel, H, !IO),
+draw_list(_Pred, _Screen, _Panel, _Attr, [], !IO).
+draw_list(Pred, Screen, Panel, Attr, [H | T], !IO) :-
+    Pred(Screen, Panel, H, !IO),
     (
         T = []
     ;
         T = [_ | _],
-        draw(Panel, Attr, ", ", !IO),
-        draw_list(Pred, Panel, Attr, T, !IO)
+        draw(Screen, Panel, Attr, ", ", !IO),
+        draw_list(Pred, Screen, Panel, Attr, T, !IO)
     ).
 
 :- type show_crypto
@@ -1360,20 +1361,21 @@ draw_list(Pred, Panel, Attr, [H | T], !IO) :-
             ).
 
 :- pred draw_addresses(compose_attrs::in, show_crypto::in, crypto_info::in,
-    panel::in, list(address)::in, io::di, io::uo) is det.
+    screen::in, vpanel::in, list(address)::in, io::di, io::uo) is det.
 
-draw_addresses(Attrs, ShowCrypto, CryptoInfo, Panel, Addresses, !IO) :-
+draw_addresses(Attrs, ShowCrypto, CryptoInfo, Screen, Panel, Addresses, !IO) :-
     Attr = Attrs ^ c_generic ^ field_body,
     draw_list(draw_address(Attrs, ShowCrypto, CryptoInfo),
-        Panel, Attr, Addresses, !IO).
+        Screen, Panel, Attr, Addresses, !IO).
 
 :- pred draw_addresses_and_account(compose_attrs::in, show_crypto::in,
-    crypto_info::in, maybe(account)::in, panel::in, list(address)::in,
-    io::di, io::uo) is det.
+    crypto_info::in, maybe(account)::in, screen::in, vpanel::in,
+    list(address)::in, io::di, io::uo) is det.
 
 draw_addresses_and_account(Attrs, ShowCrypto, CryptoInfo, MaybeAccount,
-        Panel, Addresses, !IO) :-
-    draw_addresses(Attrs, ShowCrypto, CryptoInfo, Panel, Addresses, !IO),
+        Screen, Panel, Addresses, !IO) :-
+    draw_addresses(Attrs, ShowCrypto, CryptoInfo, Screen, Panel, Addresses,
+        !IO),
     Attr = Attrs ^ c_generic ^ field_body,
     (
         MaybeAccount = yes(Account),
@@ -1383,29 +1385,30 @@ draw_addresses_and_account(Attrs, ShowCrypto, CryptoInfo, MaybeAccount,
         MaybeAccount = no,
         AccountString = " (no account)"
     ),
-    draw(Panel, Attr, AccountString, !IO).
+    draw(Screen, Panel, Attr, AccountString, !IO).
 
 :- pred draw_address(compose_attrs::in, show_crypto::in, crypto_info::in,
-    panel::in, address::in, io::di, io::uo) is det.
+    screen::in, vpanel::in, address::in, io::di, io::uo) is det.
 
-draw_address(Attrs, ShowCrypto, CryptoInfo, Panel, Address, !IO) :-
+draw_address(Attrs, ShowCrypto, CryptoInfo, Screen, Panel, Address, !IO) :-
     (
         Address = mailbox(Mailbox),
-        draw_mailbox(Attrs, ShowCrypto, CryptoInfo, Panel, Mailbox, !IO)
+        draw_mailbox(Attrs, ShowCrypto, CryptoInfo, Screen, Panel, Mailbox,
+            !IO)
     ;
         Address = group(DisplayName, Mailboxes),
-        draw_display_name(Attrs, Panel, DisplayName, !IO),
+        draw_display_name(Attrs, Screen, Panel, DisplayName, !IO),
         Attr = Attrs ^ c_generic ^ field_body,
-        draw(Panel, Attr, ": ", !IO),
-        draw_list(draw_mailbox(Attrs, ShowCrypto, CryptoInfo), Panel, Attr,
-            Mailboxes, !IO),
-        draw(Panel, Attr, ";", !IO)
+        draw(Screen, Panel, Attr, ": ", !IO),
+        draw_list(draw_mailbox(Attrs, ShowCrypto, CryptoInfo),
+            Screen, Panel, Attr, Mailboxes, !IO),
+        draw(Screen, Panel, Attr, ";", !IO)
     ).
 
-:- pred draw_display_name(compose_attrs::in, panel::in, display_name::in,
-    io::di, io::uo) is det.
+:- pred draw_display_name(compose_attrs::in, screen::in, vpanel::in,
+    display_name::in, io::di, io::uo) is det.
 
-draw_display_name(Attrs, Panel, DisplayName, !IO) :-
+draw_display_name(Attrs, Screen, Panel, DisplayName, !IO) :-
     display_name_to_string(for_display, DisplayName, String, Valid),
     (
         Valid = yes,
@@ -1414,35 +1417,35 @@ draw_display_name(Attrs, Panel, DisplayName, !IO) :-
         Valid = no,
         Attr = Attrs ^ c_invalid
     ),
-    draw(Panel, Attr, String, !IO).
+    draw(Screen, Panel, Attr, String, !IO).
 
 :- pred draw_mailbox(compose_attrs::in, show_crypto::in, crypto_info::in,
-    panel::in, mailbox::in, io::di, io::uo) is det.
+    screen::in, vpanel::in, mailbox::in, io::di, io::uo) is det.
 
-draw_mailbox(Attrs, ShowCrypto, CryptoInfo, Panel, Mailbox, !IO) :-
+draw_mailbox(Attrs, ShowCrypto, CryptoInfo, Screen, Panel, Mailbox, !IO) :-
     (
         Mailbox = mailbox(yes(DisplayName), AddrSpec),
-        draw_display_name(Attrs, Panel, DisplayName, !IO),
+        draw_display_name(Attrs, Screen, Panel, DisplayName, !IO),
         Attr = Attrs ^ c_generic ^ field_body,
-        draw(Panel, Attr, " <", !IO),
-        draw_addr_spec(Attrs, Panel, AddrSpec, !IO),
-        draw(Panel, Attr, ">", !IO),
-        draw_mailbox_crypto(Attrs, ShowCrypto, CryptoInfo, Panel, AddrSpec,
-            !IO)
+        draw(Screen, Panel, Attr, " <", !IO),
+        draw_addr_spec(Attrs, Screen, Panel, AddrSpec, !IO),
+        draw(Screen, Panel, Attr, ">", !IO),
+        draw_mailbox_crypto(Attrs, ShowCrypto, CryptoInfo, Screen, Panel,
+            AddrSpec, !IO)
     ;
         Mailbox = mailbox(no, AddrSpec),
-        draw_addr_spec(Attrs, Panel, AddrSpec, !IO),
-        draw_mailbox_crypto(Attrs, ShowCrypto, CryptoInfo, Panel, AddrSpec,
-            !IO)
+        draw_addr_spec(Attrs, Screen, Panel, AddrSpec, !IO),
+        draw_mailbox_crypto(Attrs, ShowCrypto, CryptoInfo, Screen, Panel,
+            AddrSpec, !IO)
     ;
         Mailbox = bad_mailbox(String),
-        draw(Panel, Attrs ^ c_invalid, String, !IO)
+        draw(Screen, Panel, Attrs ^ c_invalid, String, !IO)
     ).
 
-:- pred draw_addr_spec(compose_attrs::in, panel::in, addr_spec::in,
-    io::di, io::uo) is det.
+:- pred draw_addr_spec(compose_attrs::in, screen::in, vpanel::in,
+    addr_spec::in, io::di, io::uo) is det.
 
-draw_addr_spec(Attrs, Panel, AddrSpec, !IO) :-
+draw_addr_spec(Attrs, Screen, Panel, AddrSpec, !IO) :-
     addr_spec_to_string(AddrSpec, String, Valid),
     (
         Valid = yes,
@@ -1451,12 +1454,14 @@ draw_addr_spec(Attrs, Panel, AddrSpec, !IO) :-
         Valid = no,
         Attr = Attrs ^ c_invalid
     ),
-    draw(Panel, Attr, String, !IO).
+    draw(Screen, Panel, Attr, String, !IO).
 
 :- pred draw_mailbox_crypto(compose_attrs::in, show_crypto::in,
-    crypto_info::in, panel::in, addr_spec::in, io::di, io::uo) is det.
+    crypto_info::in, screen::in, vpanel::in, addr_spec::in, io::di, io::uo)
+    is det.
 
-draw_mailbox_crypto(Attrs, ShowCrypto, CryptoInfo, Panel, AddrSpec, !IO) :-
+draw_mailbox_crypto(Attrs, ShowCrypto, CryptoInfo, Screen, Panel, AddrSpec,
+        !IO) :-
     ShowCrypto = show_crypto(ShowEncryptKey, ShowSignKey),
     CryptoInfo = crypto_info(_, Encrypt, EncryptKeys, Sign, SignKeys),
     E = Encrypt `and` ShowEncryptKey,
@@ -1495,10 +1500,10 @@ draw_mailbox_crypto(Attrs, ShowCrypto, CryptoInfo, Panel, AddrSpec, !IO) :-
     ),
     ( combine(DrawE, DrawS) ->
         % Combine E: S:
-        draw_key(Attrs, Panel, PrefixE ++ PrefixS, DrawE, !IO)
+        draw_key(Attrs, Screen, Panel, PrefixE ++ PrefixS, DrawE, !IO)
     ;
-        draw_key(Attrs, Panel, PrefixE, DrawE, !IO),
-        draw_key(Attrs, Panel, PrefixS, DrawS, !IO)
+        draw_key(Attrs, Screen, Panel, PrefixE, DrawE, !IO),
+        draw_key(Attrs, Screen, Panel, PrefixS, DrawS, !IO)
     ).
 
 :- type draw_key
@@ -1513,11 +1518,11 @@ combine(X, Y) :-
     Y = found(key_userid(KeyY, UserId)),
     get_key_info(KeyX) = get_key_info(KeyY).
 
-:- pred draw_key(compose_attrs::in, panel::in, string::in, draw_key::in,
-    io::di, io::uo) is det.
+:- pred draw_key(compose_attrs::in, screen::in, vpanel::in, string::in,
+    draw_key::in, io::di, io::uo) is det.
 
-draw_key(_Attrs, _Panel, _Prefix, none, !IO).
-draw_key(Attrs, Panel, Prefix, found(key_userid(Key, UserId)), !IO) :-
+draw_key(_Attrs, _Screen, _Panel, _Prefix, none, !IO).
+draw_key(Attrs, Screen, Panel, Prefix, found(key_userid(Key, UserId)), !IO) :-
     KeyInfo = get_key_info(Key),
     SubKeys = KeyInfo ^ key_subkeys,
     ( SubKeys = [SubKey | _] ->
@@ -1530,25 +1535,25 @@ draw_key(Attrs, Panel, Prefix, found(key_userid(Key, UserId)), !IO) :-
             Text = format(" [%s: %s, validity: %s]",
                 [s(Prefix), s(Fpr), s(Validity)])
         ),
-        draw(Panel, Attr, Text, !IO)
+        draw(Screen, Panel, Attr, Text, !IO)
     ;
         % Should not happen. 
-        draw(Panel, Attrs ^ c_generic ^ good_key, " [no subkey]", !IO)
+        draw(Screen, Panel, Attrs ^ c_generic ^ good_key, " [no subkey]", !IO)
     ).
-draw_key(Attrs, Panel, Prefix, not_found, !IO) :-
+draw_key(Attrs, Screen, Panel, Prefix, not_found, !IO) :-
     ( Prefix = "" ->
         Text = " [no key found]"
     ;
         Text = format(" [%s: no key found]", [s(Prefix)])
     ),
-    draw(Panel, Attrs ^ c_generic ^ bad_key, Text, !IO).
+    draw(Screen, Panel, Attrs ^ c_generic ^ bad_key, Text, !IO).
 
 :- func short_fpr(string) = string.
 
 short_fpr(Fpr) = string.right_by_codepoint(Fpr, 8).
 
-:- pred validity_attr(compose_attrs::in, validity::in, string::out, attr::out)
-    is det.
+:- pred validity_attr(compose_attrs::in, validity::in, string::out,
+    curs.attr::out) is det.
 
 validity_attr(Attrs, Validity, String, Attr) :-
     validity(Validity, String, GoodKey),
@@ -1569,10 +1574,10 @@ validity(validity_marginal, "marginal", yes).
 validity(validity_full, "full", yes).
 validity(validity_ultimate, "ultimate", yes).
 
-:- pred draw_crypto_line(compose_attrs::in, panel::in, crypto_info::in,
-    io::di, io::uo) is det.
+:- pred draw_crypto_line(compose_attrs::in, screen::in, vpanel::in,
+    crypto_info::in, io::di, io::uo) is det.
 
-draw_crypto_line(Attrs, Panel, CryptoInfo, !IO) :-
+draw_crypto_line(Attrs, Screen, Panel, CryptoInfo, !IO) :-
     CryptoInfo ^ ci_encrypt = Encrypt,
     CryptoInfo ^ ci_sign = Sign,
     (
@@ -1592,14 +1597,15 @@ draw_crypto_line(Attrs, Panel, CryptoInfo, !IO) :-
         Sign = no,
         Body = "none"
     ),
-    panel.erase(Panel, !IO),
-    draw(Panel, Attrs ^ c_generic ^ field_name, "  Crypto: ", !IO),
-    draw(Panel, Attrs ^ c_generic ^ field_body, Body, !IO).
+    erase(Screen, Panel, !IO),
+    draw(Screen, Panel, Attrs ^ c_generic ^ field_name, "  Crypto: ", !IO),
+    draw(Screen, Panel, Attrs ^ c_generic ^ field_body, Body, !IO).
 
-:- pred draw_attachment_line(compose_attrs::in, panel::in, attachment::in,
-    int::in, bool::in, io::di, io::uo) is det.
+:- pred draw_attachment_line(compose_attrs::in, screen::in, vpanel::in,
+    attachment::in, int::in, bool::in, io::di, io::uo) is det.
 
-draw_attachment_line(Attrs, Panel, Attachment, LineNr, IsCursor, !IO) :-
+draw_attachment_line(Attrs, Screen, Panel, Attachment, LineNr, IsCursor, !IO)
+        :-
     (
         Attachment = old_attachment(Part),
         Part = part(_MessageId, _PartId, ContentType, MaybeContentDisposition,
@@ -1616,20 +1622,20 @@ draw_attachment_line(Attrs, Panel, Attachment, LineNr, IsCursor, !IO) :-
         MaybeContentDisposition = no,
         MaybeContentLength = yes(content_length(Size))
     ),
-    panel.erase(Panel, !IO),
-    panel.move(Panel, 0, 10, !IO),
+    erase(Screen, Panel, !IO),
+    move(Screen, Panel, 0, 10, !IO),
     Attr = Attrs ^ c_generic ^ field_body,
-    draw(Panel, Attr, format("%d. ", [i(LineNr + 1)]), !IO),
+    draw(Screen, Panel, Attr, format("%d. ", [i(LineNr + 1)]), !IO),
     (
         IsCursor = yes,
-        FilenameAttr = Attr + reverse
+        FilenameAttr = curs.(Attr + curs.reverse)
     ;
         IsCursor = no,
         FilenameAttr = Attr
     ),
-    draw(Panel, FilenameAttr, Filename, !IO),
-    draw(Panel, Attr, " (", !IO),
-    draw(Panel, Attr, mime_type.to_string(ContentType), !IO),
+    draw(Screen, Panel, FilenameAttr, Filename, !IO),
+    draw(Screen, Panel, Attr, " (", !IO),
+    draw(Screen, Panel, Attr, mime_type.to_string(ContentType), !IO),
     /*
     (
         MaybeContentCharset = yes(content_charset(Charset)),
@@ -1642,49 +1648,48 @@ draw_attachment_line(Attrs, Panel, Attachment, LineNr, IsCursor, !IO) :-
         MaybeContentDisposition = yes(content_disposition(Disposition)),
         Disposition \= "attachment"
     ->
-        draw(Panel, Attr, "; " ++ Disposition, !IO)
+        draw(Screen, Panel, Attr, "; " ++ Disposition, !IO)
     ;
         true
     ),
-    draw(Panel, Attr, ")", !IO),
+    draw(Screen, Panel, Attr, ")", !IO),
     (
         MaybeContentLength = yes(content_length(Length)),
         % This is the encoded size.
-        draw2(Panel, " ", format_approx_length(Length), !IO)
+        draw2(Screen, Panel, " ", format_approx_length(Length), !IO)
     ;
         MaybeContentLength = no
     ).
 
-:- pred draw_attachments_label(compose_attrs::in, list(panel)::in,
+:- pred draw_attachments_label(screen::in, list(vpanel)::in, compose_attrs::in,
     io::di, io::uo) is det.
 
-draw_attachments_label(_Attrs, [], !IO).
-draw_attachments_label(Attrs, [Panel | _], !IO) :-
-    panel.move(Panel, 0, 0, !IO),
-    draw(Panel, Attrs ^ c_generic ^ field_name, "  Attach: ", !IO).
+draw_attachments_label(_Screen, [], _Attrs, !IO).
+draw_attachments_label(Screen, [Panel | _], Attrs, !IO) :-
+    move(Screen, Panel, 0, 0, !IO),
+    draw(Screen, Panel, Attrs ^ c_generic ^ field_name, "  Attach: ", !IO).
 
-:- pred draw_sep_bar(compose_attrs::in, screen::in, maybe(panel)::in,
+:- pred draw_sep_bar(screen::in, maybe(vpanel)::in, compose_attrs::in,
     io::di, io::uo) is det.
 
-draw_sep_bar(_, _, no, !IO).
-draw_sep_bar(Attrs, Screen, yes(Panel), !IO) :-
-    Attr = Attrs ^ c_status ^ bar,
-    get_cols(Screen, Cols),
-    panel.erase(Panel, !IO),
-    draw(Panel, Attr,
+draw_sep_bar(_, no, _, !IO).
+draw_sep_bar(Screen, yes(Panel), Attrs, !IO) :-
+    get_cols(Screen, Cols, !IO),
+    erase(Screen, Panel, !IO),
+    draw(Screen, Panel, Attrs ^ c_status ^ bar,
         "-- (ftcbsr) edit fields; (E)ncrypt, (S)ign; " ++
         "(a)ttach, (d)etach, media (T)ype ", !IO),
-    hline(Panel, char.to_int('-'), Cols, !IO).
+    hline(Screen, Panel, '-', Cols, !IO).
 
 :- pred draw_staging_bar(compose_attrs::in, screen::in, staging_info::in,
     io::di, io::uo) is det.
 
 draw_staging_bar(Attrs, Screen, StagingInfo, !IO) :-
     MaybeOldDraft = StagingInfo ^ si_old_msgid,
-    get_cols(Screen, Cols),
-    get_bar_panel(Screen, Panel),
-    panel.erase(Panel, !IO),
-    draw(Panel, Attrs ^ c_status ^ bar, "-- ", !IO),
+    get_cols(Screen, Cols, !IO),
+    Panel = bar_panel,
+    erase(Screen, Panel, !IO),
+    draw(Screen, Panel, Attrs ^ c_status ^ bar, "-- ", !IO),
     (
         MaybeOldDraft = yes(_),
         Msg = "Compose: (e) edit, (p) postpone, (Y) send, " ++
@@ -1693,7 +1698,7 @@ draw_staging_bar(Attrs, Screen, StagingInfo, !IO) :-
         MaybeOldDraft = no,
         Msg = "Compose: (e) edit, (p) postpone, (Y) send, (Q) abandon."
     ),
-    draw_fixed(Panel, Cols - 3, Msg, '-', !IO).
+    draw_fixed(Screen, Panel, Cols - 3, Msg, '-', !IO).
 
 %-----------------------------------------------------------------------------%
 
@@ -1829,6 +1834,12 @@ prompt_confirm(Screen, Prompt, Res, !IO) :-
         Res = yes
     ; KeyCode = char('y') ->
         Res = yes
+    ; KeyCode = code(curs.key_resize) ->
+        % XXX handle resize properly
+        % Unforunately we need to pass down a lot of data to redraw the screen.
+        % Forunately this confirmation prompt occurs rarely.
+        recreate_screen_for_resize(Screen, !IO),
+        prompt_confirm(Screen, Prompt, Res, !IO)
     ;
         Res = no
     ).
@@ -2188,7 +2199,7 @@ make_attachment_mime_part(TextCTE, Attachment, MimePart) :-
             make_text_mime_part(WriteContentDisposition, TextCTE, Text,
                 MimePart)
         ;
-            Content = binary_base64(Base64),
+            Content = base64_encoded(Base64),
             TypeString = mime_type.to_string(Type),
             MimePart = discrete(content_type(TypeString),
                 yes(WriteContentDisposition), yes(cte_base64), base64(Base64))

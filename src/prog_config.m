@@ -49,10 +49,14 @@
 
 :- pred get_open_url_command(prog_config::in, string::out) is det.
 
+:- pred get_pipe_id_command(prog_config::in, string::out) is det.
+
 :- pred get_poll_notify_command(prog_config::in, maybe(command_prefix)::out)
     is det.
 
 :- pred get_poll_period_secs(prog_config::in, maybe(int)::out) is det.
+
+:- pred get_wrap_width(prog_config::in, int::in, int::out) is det.
 
 :- pred get_text_filter_command(prog_config::in, mime_type::in,
     command_prefix::out) is semidet.
@@ -125,8 +129,10 @@
                 text_filters    :: map(mime_type, command_prefix),
                 open_part       :: string, % not shell-quoted
                 open_url        :: string, % not shell-quoted
+                pipe_id         :: string, % not shell-quoted
                 poll_notify     :: maybe(command_prefix),
                 poll_period_secs :: maybe(int),
+                wrap_width      :: maybe(int),
                 encrypt_by_default :: bool,
                 sign_by_default :: bool,
                 decrypt_by_default :: bool,
@@ -235,6 +241,12 @@ make_prog_config(Config, ProgConfig, NotmuchConfig, !Errors, !IO) :-
         OpenUrl = default_open_url_command
     ),
 
+    ( search_config(Config, "command", "pipe_id", PipeId0) ->
+        PipeId = PipeId0
+    ;
+        PipeId = default_pipe_id_command
+    ),
+
     (
         search_config(Config, "command", "poll_notify", PollNotify0),
         PollNotify0 \= ""
@@ -252,6 +264,16 @@ make_prog_config(Config, ProgConfig, NotmuchConfig, !Errors, !IO) :-
         check_poll_period_secs(PollSecs0, PollSecs, !Errors)
     ;
         PollSecs = default_poll_period_secs
+    ),
+
+    (
+        search_config(Config, "ui", "wrap_width", WrapWidth0),
+        string.to_int(WrapWidth0, WrapWidthInt),
+        WrapWidthInt > 0
+    ->
+        WrapWidth = yes(WrapWidthInt)
+    ;
+        WrapWidth = no
     ),
 
     some [!Filters] (
@@ -365,8 +387,10 @@ make_prog_config(Config, ProgConfig, NotmuchConfig, !Errors, !IO) :-
     ProgConfig ^ editor = Editor,
     ProgConfig ^ open_part = OpenPart,
     ProgConfig ^ open_url = OpenUrl,
+    ProgConfig ^ pipe_id = PipeId,
     ProgConfig ^ poll_notify = PollNotify,
     ProgConfig ^ poll_period_secs = PollSecs,
+    ProgConfig ^ wrap_width = WrapWidth,
     ProgConfig ^ text_filters = Filters,
     ProgConfig ^ encrypt_by_default = EncryptByDefault,
     ProgConfig ^ sign_by_default = SignByDefault,
@@ -734,11 +758,24 @@ get_open_part_command(Config, Command) :-
 get_open_url_command(Config, Command) :-
     Command = Config ^ open_url.
 
+get_pipe_id_command(Config, Command) :-
+    Command = Config ^ pipe_id.
+
 get_poll_notify_command(Config, Command) :-
     Command = Config ^ poll_notify.
 
 get_poll_period_secs(Config, PollPeriodSecs) :-
     PollPeriodSecs = Config ^ poll_period_secs.
+
+get_wrap_width(Config, Cols, WrapWidth) :-
+    MaybeWrapWidth = Config ^ wrap_width,
+    (
+        MaybeWrapWidth = yes(WrapWidth0),
+        WrapWidth = min(WrapWidth0, Cols)
+    ;
+        MaybeWrapWidth = no,
+        WrapWidth = Cols
+    ).
 
 get_text_filter_command(Config, MimeType, Command) :-
     Filters = Config ^ text_filters,
@@ -855,6 +892,10 @@ default_open_part_command = "xdg-open&".
 :- func default_open_url_command = string.
 
 default_open_url_command = "xdg-open&".
+
+:- func default_pipe_id_command = string.
+
+default_pipe_id_command = "xclip".
 
 :- func default_poll_period_secs = maybe(int).
 
