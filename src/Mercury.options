@@ -2,7 +2,7 @@
 MAIN_TARGET = bower
 
 # Link with curses.
-MLLIBS-bower += -lncursesw -lpanelw
+MLLIBS-bower += -lncursesw -ltinfow -lpanelw
 
 # Build with gpgme.
 CFLAGS += -D_FILE_OFFSET_BITS=64
